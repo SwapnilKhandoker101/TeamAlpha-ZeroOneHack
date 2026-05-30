@@ -8,17 +8,20 @@ relabelling it.
 
 import pytest
 
-from gas_agent.driver_curation import CuratedDriver, CurationResult
+from gas_agent.driver_curation import GLOBAL_RISK_THEME, CuratedDriver, CurationResult
 from gas_agent.hedge_policy import MonthForecast, decide_all, quarter_hedge_ratio
 from gas_agent.scenario import (
+    AUTO_PREMIUM_CAP,
     DEFAULT_SHOCK_PARAMS,
     ShockParams,
     apply_shock,
     parse_shock_request,
+    risk_importance_share,
     run_shock,
     shock_forecast_json,
     shock_risk_premium,
     shocked_curation,
+    standing_risk_premium,
 )
 
 
@@ -210,3 +213,67 @@ def test_run_shock_respects_custom_params():
     assert quarter_hedge_ratio(outcome.decisions) == pytest.approx(
         quarter_hedge_ratio(decide_all(MONTHS, SPOT))
     )
+
+
+# --------------------------------------------------------------------------- #
+# Standing supply-risk premium (the calm-path "dynamic weighting")
+# --------------------------------------------------------------------------- #
+def _kept(*drivers: CuratedDriver) -> CurationResult:
+    return CurationResult(kept=list(drivers), rejected=[], min_kept_drivers=8)
+
+
+def _drv(name: str, importance: float, region: str, theme: str = "energy trade flow") -> CuratedDriver:
+    return CuratedDriver(name, importance, 0.3, region, theme, "keep", "x")
+
+
+def test_standing_premium_zero_without_risk_drivers():
+    cur = _kept(
+        _drv("Electricity prices - Germany", 50.0, "Germany", "electricity & power"),
+        _drv("Exports of Natural gas in Europe", 50.0, "Europe", "natural gas"),
+    )
+    assert standing_risk_premium(cur) == 0.0
+    assert risk_importance_share(cur) == 0.0
+
+
+def test_standing_premium_rises_with_risk_share_and_clamps():
+    low = _kept(
+        _drv("Gas imports - Russia", 10.0, "Russia"),
+        _drv("Electricity prices - Germany", 90.0, "Germany", "electricity & power"),
+    )
+    high = _kept(
+        _drv("Gas imports - Russia", 40.0, "Russia"),
+        _drv("Electricity prices - Germany", 60.0, "Germany", "electricity & power"),
+    )
+    assert standing_risk_premium(high) > standing_risk_premium(low) > 0.0
+    full = _kept(_drv("Gas imports - Iran", 100.0, "Iran"))
+    assert standing_risk_premium(full) == pytest.approx(AUTO_PREMIUM_CAP)  # share 1.0 -> clamped
+
+
+def test_global_risk_theme_counts_outside_risk_regions():
+    # "World" is not a RISK_REGION, but the global-risk theme makes the driver count.
+    cur = _kept(
+        _drv("VIX volatility index", 25.0, "World", GLOBAL_RISK_THEME),
+        _drv("Electricity prices - Germany", 75.0, "Germany", "electricity & power"),
+    )
+    assert risk_importance_share(cur) == pytest.approx(0.25)
+    assert standing_risk_premium(cur) == pytest.approx(0.05)
+
+
+def test_run_shock_adds_standing_premium_on_top_of_the_marginal():
+    base = 0.08
+    marginal = shock_risk_premium(1.0)
+    out = run_shock(MONTHS, SPOT, _curation(), magnitude=1.0, base_risk_premium=base)
+    expected = min(AUTO_PREMIUM_CAP + DEFAULT_SHOCK_PARAMS.risk_premium, base + marginal)
+    # The per-month decisions carry the COMBINED premium...
+    assert all(d.risk_premium == pytest.approx(expected) for d in out.decisions)
+    # ...while ShockOutcome.risk_premium still reports the shock's OWN marginal.
+    assert out.risk_premium == pytest.approx(marginal)
+    # A standing premium only raises the floor — never below the base=0 shock.
+    base0 = run_shock(MONTHS, SPOT, _curation(), magnitude=1.0, base_risk_premium=0.0)
+    assert quarter_hedge_ratio(out.decisions) >= quarter_hedge_ratio(base0.decisions)
+
+
+def test_run_shock_combined_premium_is_capped():
+    out = run_shock(MONTHS, SPOT, _curation(), magnitude=1.0, base_risk_premium=0.30)
+    cap = AUTO_PREMIUM_CAP + DEFAULT_SHOCK_PARAMS.risk_premium
+    assert all(d.risk_premium == pytest.approx(cap) for d in out.decisions)

@@ -19,6 +19,7 @@ documented client even when the demo path only ever reads the cache.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -121,6 +122,135 @@ def get_latest_job() -> str | None:
         value = LATEST_JOB_POINTER.read_text().strip()
         return value or None
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Live forecast orchestration (opt-in; off the default demo path)
+# --------------------------------------------------------------------------- #
+# The four artifacts the dashboard reads for any job. A live refresh must fetch
+# and cache all of them so every downstream panel (forecast band, driver
+# curation, backtest verdict, globe) has the data it expects.
+FORECAST_ARTIFACTS: tuple[str, ...] = (
+    "forecast",
+    "external_signals",
+    "backtest_metrics",
+    "backtest_trajectories",
+)
+
+# Statuses Sybilion reports for a job; these two are terminal.
+TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
+
+# The TTF document already carries a good title/description; these are the
+# defaults a live caller inherits when it does not pass its own. The API
+# requires a title (20-511 chars) and accepts a description (<=2048 chars).
+DEFAULT_SERIES_TITLE = (
+    "European natural gas price — Dutch TTF front-month futures, monthly close in EUR/MWh"
+)
+DEFAULT_SERIES_DESCRIPTION = (
+    "Monthly closing price of Dutch TTF natural gas front-month futures in EUR/MWh. "
+    "TTF is the benchmark wholesale gas price for continental Europe. Used by an "
+    "energy-intensive EU industrial buyer (a German glass/ceramics manufacturer) to "
+    "decide what share of next quarter's gas to lock in forward versus leave to spot."
+)
+
+
+def build_forecast_payload(
+    timeseries: dict,
+    *,
+    title: str = DEFAULT_SERIES_TITLE,
+    description: str = DEFAULT_SERIES_DESCRIPTION,
+    keywords: list[str] | None = None,
+    category_ids: list[int] | None = None,
+    region_codes: list[int] | None = None,
+    soft_horizon: int = 6,
+    recency_factor: float = 0.5,
+    backtest: bool = True,
+    limit: int = 1000,
+) -> dict:
+    """Assemble the documented Sybilion forecast request body.
+
+    Takes primitives (not a ``KeywordSelection``) so this module never imports
+    :mod:`gas_agent.keyword_agent`, keeping the dependency arrow one-directional.
+    ``timeseries`` is the ``{month: price}`` map from ``ttf_series.json``;
+    keywords / categories / regions come from the selected filters. The keywords
+    live under ``timeseries_metadata`` (the API has no top-level keywords field).
+    """
+    return {
+        "soft_horizon": soft_horizon,
+        "hard_horizon": None,
+        "backtest": backtest,
+        "frequency": "monthly",
+        "timeseries": dict(timeseries),
+        "recency_factor": recency_factor,
+        "strictly_positive": False,
+        "timeseries_metadata": {
+            "title": title,
+            "description": description,
+            "keywords": list(keywords or []),
+        },
+        "filters": {
+            "categories": list(category_ids or []),
+            "regions": list(region_codes or []),
+            "limit": limit,
+        },
+        "pipeline_version": "v1",
+    }
+
+
+def _job_id_from_descriptor(descriptor: dict) -> str | None:
+    """Pull the new job id out of a submit/status descriptor, tolerating the
+    documented key spellings."""
+    for key in ("job_id", "id", "forecast_id"):
+        value = descriptor.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _status_from_descriptor(descriptor: dict) -> str:
+    raw = descriptor.get("status") or descriptor.get("state") or ""
+    return str(raw).strip().lower()
+
+
+def run_live_forecast(
+    client: SybilionClient,
+    payload: dict,
+    *,
+    poll_interval: float = 3.0,
+    timeout: float = 180.0,
+) -> str:
+    """Submit a forecast, poll until it finishes, cache its artifacts, return the id.
+
+    Non-destructive by design: this fetches and saves the four artifacts under
+    ``cache/<job_id>/`` but deliberately does **not** call :func:`set_latest_job`,
+    so the pinned demo job remains the default and toggling live refresh off
+    instantly restores the deterministic numbers.
+
+    Raises ``RuntimeError`` if the submit returns no id or the job fails, and
+    ``TimeoutError`` if it has not reached a terminal status within ``timeout``.
+    """
+    descriptor = client.submit_forecast(payload)
+    job_id = _job_id_from_descriptor(descriptor)
+    if not job_id:
+        raise RuntimeError(f"Sybilion submit returned no job id: {descriptor!r}")
+
+    deadline = time.monotonic() + timeout
+    status = _status_from_descriptor(descriptor)
+    while status not in TERMINAL_STATUSES:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Sybilion job {job_id} did not finish within {timeout:.0f}s "
+                f"(last status: {status or 'unknown'})"
+            )
+        time.sleep(poll_interval)
+        status = _status_from_descriptor(client.get_forecast(job_id))
+
+    if status == "failed":
+        raise RuntimeError(f"Sybilion job {job_id} reported failure")
+
+    for name in FORECAST_ARTIFACTS:
+        save_artifact(job_id, name, client.get_artifact(job_id, name))
+    return job_id
 
 
 # --------------------------------------------------------------------------- #

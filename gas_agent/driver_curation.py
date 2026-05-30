@@ -22,6 +22,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# The theme a driver matches when it traces to a geopolitical / market-risk signal
+# (Brent-style risk premia, the VIX, named conflicts). Defined as a module constant
+# because the scenario engine imports it by name to compute the standing supply-risk
+# premium — keeping the two modules in lockstep instead of duplicating a string.
+GLOBAL_RISK_THEME = "global risk & volatility"
+
 # --------------------------------------------------------------------------- #
 # What counts as a credible European-gas driver, by theme.
 # Ordered most-specific first so the *cited* theme is the meaningful one
@@ -31,13 +37,20 @@ CREDIBLE_THEMES: dict[str, tuple[str, ...]] = {
     "natural gas": ("natural gas", "extraction of natural gas"),
     "LNG": ("liquefied natural gas",),
     "petroleum gas (LPG)": ("liquefied petroleum", "petroleum gas"),
-    "oil & petroleum products": ("petroleum", "gasoil", "crude", "oil"),
+    "oil & petroleum products": ("petroleum", "gasoil", "crude", "oil", "brent"),
     "electricity & power": ("electricity", "power"),
     "energy prices & benchmarks": ("energy",),
     "coal & carbon": ("coal", "carbon", "emission"),
     "extraction & mining": ("mining", "quarrying", "extraction"),
     "exchange rates (FX)": ("exchange rate",),
     "interest rates": ("interest rate",),
+    # Geopolitical / volatility risk and macro demand indicators. Placed after the
+    # energy themes (most-specific-first) so an energy series still cites its energy
+    # theme; these catch the risk/macro series Sybilion may surface in future pulls.
+    GLOBAL_RISK_THEME: (
+        "global risk", "geopolitical", "volatility index", "vix", "risk index", "conflict",
+    ),
+    "macro indicators": ("purchasing managers", "pmi", "inflation", "consumer price", "cpi"),
     "producer & import prices": ("producer price", "import price"),
     "stocks & storage": ("stock level", "stocks of", "storage"),
     "commodities": ("commodit",),

@@ -126,7 +126,26 @@ uv run python scripts/build_voiceover.py       # regenerate narration into cache
 ## 5. Current state (as of 2026-05-30)
 
 **Everything in the original 13-task plan is built and verified.** All three judging
-axes are covered. 82 tests pass.
+axes are covered. **111 tests pass.**
+
+A second wave (the `edges.md` follow-up) is also built and verified:
+1. **Future-proof whitelist keywords** — `driver_curation` now recognises Brent,
+   a `global risk & volatility` theme (VIX / geopolitical / risk index), and a
+   `macro indicators` theme (PMI / inflation / CPI). No-ops on the current cached
+   job (no such series yet); they classify as *keep* the day Sybilion surfaces them.
+2. **Standing supply-risk premium** — deterministic "dynamic weighting":
+   `scenario.standing_risk_premium(curation)` turns the kept-driver risk-importance
+   share into a premium fed through the **existing** `hedge_policy.risk_premium`
+   (THE RULE holds — pure arithmetic, no LLM). It lifts the calm lock and composes
+   with the shock. The backtest stays **premium-free** (a transparent live overlay).
+3. **Optional live Sybilion refresh** — `sybilion_client.build_forecast_payload` +
+   `run_live_forecast` (submit→poll→cache 4 artifacts, never repoints
+   `latest_job.txt`), behind a sidebar toggle (default OFF, disabled with no key).
+   Cached demo is restored instantly on toggle-off.
+4. **Push-to-talk voice assistant** — `transcribe.py` (NVIDIA Riva ASR → HuggingFace
+   Whisper → None, sharing `voice.py`'s rate-limit window) + `voice_chat.answer_question`
+   (grounded, explanation-only, Featherless→template). `st.audio_input` mic in the
+   sidebar; hidden when no ASR key (text chat + no-keys demo unchanged).
 
 Live numbers from the cached job `f445eec1-…` (so future sessions can sanity-check
 they haven't regressed the decision):
@@ -135,23 +154,27 @@ they haven't regressed the decision):
 |----------|-------|
 | Today's spot (last actual TTF) | **€47.28/MWh** |
 | Forecast horizon | 2026-06 … 2026-11 (6 months) |
-| **Calm next-quarter hedge ratio** | **~26%** (months: 46% / 10% / 22%) |
+| **Calm next-quarter hedge ratio** | **~30.5%** (months: 53% / 10% / 29%) — includes the standing premium below; the premium-free core is **25.8%** |
+| **Standing supply-risk premium** | **+6.9%** on the lock floor — risk-region/global-risk drivers are **34.7%** of kept-driver importance (deterministic, via `hedge_policy.risk_premium`) |
 | Curation | **25 kept / 6 rejected** (needs_refine = False) |
 | Top kept driver | "Exports of Oil and petroleum products in Germany" |
 | Rejected sample | Population — Sri Lanka / Serbia / Bangladesh / Europe |
-| Backtest | **63 replayed months**: policy €1.25/MWh **cheaper** than spot, €2.34/MWh **tighter** swing, **matches** a 50% lock (policy €35.71±4.47; spot €36.96±6.81; lock-50% €35.25±4.35) |
-| Shock (magnitude 1.0) | next-quarter ratio **rises** vs calm; Iran/risk supplier lights up green on the globe; "Global supply-risk premium" leads the drivers |
+| Backtest | **63 replayed months** (premium-free): policy €1.25/MWh **cheaper** than spot, €2.34/MWh **tighter** swing, **matches** a 50% lock (policy €35.71±4.47; spot €36.96±6.81; lock-50% €35.25±4.35) |
+| Shock (magnitude 1.0) | next-quarter ratio **rises** to **~40.1%** vs the new calm 30.5% (applied premium +32%); Iran/risk supplier lights up green on the globe; "Global supply-risk premium" leads the drivers |
 
 ### Git state — IMPORTANT
-The working tree is **ahead of the last commit** and these changes are **uncommitted**:
-- **Modified:** `app.py` (Plotly globe replacing pydeck + voice wiring), `gas_agent/config.py`
-  (voice/NVIDIA config), `.env.example`, `.gitignore`.
-- **Untracked:** `gas_agent/voice.py`, `scripts/build_voiceover.py`, `tests/test_voice.py`,
-  the whole `docs/` folder, `CLAUDE.md`.
+The working tree is **ahead of the last commit** (`base`, `3fda01c`) and the
+`edges.md` follow-up wave is **uncommitted**:
+- **Modified:** `app.py` (live-refresh toggle + standing-premium wiring + push-to-talk
+  mic), `gas_agent/config.py` (ASR/HF config), `gas_agent/driver_curation.py`
+  (future-proof keywords), `gas_agent/scenario.py` (standing premium), 
+  `gas_agent/sybilion_client.py` (live forecast orchestration), `.env.example`,
+  `pyproject.toml` + `uv.lock` (optional `voice` extra), `tests/test_driver_curation.py`,
+  `tests/test_scenario.py`, `CLAUDE.md`.
+- **Untracked:** `gas_agent/transcribe.py`, `gas_agent/voice_chat.py`,
+  `tests/test_sybilion_client.py`, `tests/test_transcribe.py`, `tests/test_voice_chat.py`.
 
-The last commit (`bd23457`) still contains the **old pydeck globe**; the working tree
-has the **working Plotly orthographic globe**. Do not commit unless asked; if asked,
-stage named files (never `.env`).
+Do not commit unless asked; if asked, stage named files (never `.env`).
 
 ---
 

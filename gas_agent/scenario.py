@@ -32,7 +32,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 
-from gas_agent.driver_curation import CuratedDriver, CurationResult
+from gas_agent.driver_curation import GLOBAL_RISK_THEME, CuratedDriver, CurationResult
 from gas_agent.hedge_policy import (
     MonthDecision,
     MonthForecast,
@@ -63,6 +63,53 @@ DEFAULT_SHOCK_PARAMS = ShockParams()
 # buyer watches when geopolitics turns. Names match driver_curation's regions.
 RISK_REGIONS: tuple[str, ...] = ("Iran", "Qatar", "Russia", "Russian Federation", "Algeria")
 RISK_REGION_BOOST: float = 0.6  # importance multiplier added at magnitude 1 to risk-region drivers
+
+
+# --------------------------------------------------------------------------- #
+# Standing supply-risk premium — the calm-path "dynamic weighting".
+#
+# Even with no shock, the everyday driver mix carries information: when a large
+# share of the kept drivers' importance traces to supply-risk regions (Russia,
+# Iran, Qatar, Algeria) or the global-risk/volatility theme, the buyer is
+# structurally more exposed to a supply interruption and should carry a standing
+# lock premium. This is pure arithmetic on Sybilion's own importance scores — no
+# LLM, no randomness — fed through the SAME hedge_policy ``risk_premium`` the shock
+# uses, so THE RULE holds: the model narrates, it never sets the ratio. As the live
+# driver mix shifts day to day, this premium moves on its own (the "adapt to
+# changing conditions" story), while the cached demo stays perfectly reproducible.
+# --------------------------------------------------------------------------- #
+AUTO_PREMIUM_GAIN: float = 0.20  # premium per unit of risk-importance share
+AUTO_PREMIUM_CAP: float = 0.10   # never add more than +10pp of standing lock
+
+
+def risk_importance_share(curation: CurationResult) -> float:
+    """Fraction (0..1) of kept-driver importance that traces to a supply-risk region
+    or the global-risk theme — the basis for the standing premium and its UI readout.
+    Returns ``0.0`` when there is no positive kept importance to weigh."""
+    total = sum(max(0.0, d.importance) for d in curation.kept)
+    if total <= 0:
+        return 0.0
+    risk = sum(
+        max(0.0, d.importance)
+        for d in curation.kept
+        if d.region in RISK_REGIONS or d.theme == GLOBAL_RISK_THEME
+    )
+    return risk / total
+
+
+def standing_risk_premium(
+    curation: CurationResult,
+    gain: float = AUTO_PREMIUM_GAIN,
+    cap: float = AUTO_PREMIUM_CAP,
+) -> float:
+    """Deterministic standing premium from the share of kept-driver importance that
+    traces to supply-risk regions or the global-risk theme.
+
+    Returns ``0.0`` when no kept driver is risk-linked. Otherwise it scales linearly
+    with that share (:func:`risk_importance_share`) and is capped at ``cap``. No model,
+    no randomness — the same curation always yields the same premium, so the cached
+    demo is reproducible and a live re-curation moves it on its own."""
+    return min(cap, risk_importance_share(curation) * gain)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,19 +380,32 @@ def run_shock(
     magnitude: float,
     label: str = "",
     params: ShockParams = DEFAULT_SHOCK_PARAMS,
+    base_risk_premium: float = 0.0,
 ) -> ShockOutcome:
     """Apply a shock end-to-end: bump the forecasts, add the risk premium, re-decide
     with the same deterministic policy, and re-rank the drivers. The LLM is *not*
-    involved here — this is pure arithmetic, so the same shock always reproduces."""
+    involved here — this is pure arithmetic, so the same shock always reproduces.
+
+    ``base_risk_premium`` is the calm-path :func:`standing_risk_premium` already in
+    force before the shock; the shock's own marginal is *added* on top (clamped to a
+    sane ceiling) so a shock raises the lock above the standing baseline rather than
+    replacing it. ``ShockOutcome.risk_premium`` still reports the shock's OWN marginal
+    so the scenario panel shows the shock's effect; the per-month decisions carry the
+    combined total. ``base_risk_premium=0.0`` (the default) reproduces the old
+    behaviour exactly, so existing callers and tests are unaffected."""
     mag = clamp(magnitude, 0.0, 1.0)
     forecasts = apply_shock(baseline_forecasts, mag, params)
-    premium = shock_risk_premium(mag, params)
-    decisions = decide_all(forecasts, spot_price, risk_premium=premium)
+    marginal = shock_risk_premium(mag, params)
+    total_premium = min(
+        AUTO_PREMIUM_CAP + params.risk_premium,  # standing cap + this shock's max marginal
+        max(0.0, base_risk_premium) + marginal,
+    )
+    decisions = decide_all(forecasts, spot_price, risk_premium=total_premium)
     curated = shocked_curation(curation, mag, params)
     return ShockOutcome(
         magnitude=mag,
         label=label or params.label,
-        risk_premium=premium,
+        risk_premium=marginal,
         forecasts=forecasts,
         decisions=decisions,
         curation=curated,

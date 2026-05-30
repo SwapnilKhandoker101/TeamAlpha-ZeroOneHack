@@ -9,13 +9,18 @@ derives, and a Featherless narrative explaining the decision it did not make.
 
 from __future__ import annotations
 
+import hashlib
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from gas_agent import config
 from gas_agent import geo
 from gas_agent import sybilion_client as sc
+from gas_agent import transcribe
 from gas_agent import voice
+from gas_agent import voice_chat
 from gas_agent.config import EXPLANATION_MODEL, KEYWORD_MODEL
 from gas_agent.decision_backtest import backtest_from_cache
 from gas_agent.driver_curation import curate_drivers
@@ -25,8 +30,10 @@ from gas_agent.keyword_agent import DEFAULT_PERSONA, select_filters
 from gas_agent.scenario import (
     DEFAULT_SHOCK_PARAMS,
     parse_shock_request,
+    risk_importance_share,
     run_shock,
     shock_forecast_json,
+    standing_risk_premium,
 )
 
 st.set_page_config(page_title="TTF Gas Hedging Agent", layout="wide")
@@ -60,8 +67,11 @@ def cached_explanation(job_id: str, persona: str, quarter_ratio: float):
     forecast_json = sc.load_artifact(job_id, "forecast.json")
     signals = sc.load_artifact(job_id, "external_signals.json")
     spot = sc.last_actual_price(ttf)
-    quarter = decide_all(sc.parse_forecast_months(forecast_json), spot, DEFAULT_PARAMS)[:3]
     curation = curate_drivers(signals)
+    premium = standing_risk_premium(curation)  # the calm-path standing premium
+    quarter = decide_all(
+        sc.parse_forecast_months(forecast_json), spot, DEFAULT_PARAMS, risk_premium=premium
+    )[:3]
     return explain_decision(
         quarter, quarter_ratio, spot, curation.top_drivers(6), curation.rejected, persona
     )
@@ -83,7 +93,9 @@ def cached_shock_explanation(job_id: str, persona: str, magnitude: float, label:
     signals = sc.load_artifact(job_id, "external_signals.json")
     spot = sc.last_actual_price(ttf)
     months = sc.parse_forecast_months(forecast_json)
-    outcome = run_shock(months, spot, curate_drivers(signals), magnitude, label)
+    curation = curate_drivers(signals)
+    outcome = run_shock(months, spot, curation, magnitude, label,
+                        base_risk_premium=standing_risk_premium(curation))
     quarter = outcome.decisions[:3]
     return explain_decision(
         quarter, quarter_hedge_ratio(quarter), spot,
@@ -127,14 +139,14 @@ def _disk_voiceover(name: str):
         return None
 
 
-def render_voiceover(text: str, cache_name: str) -> None:
+def render_voiceover(text: str, cache_name: str, autoplay: bool = False) -> None:
     """Play a narration of ``text`` under the explanation: live synthesis first
     (so the audio matches the words and the caption names the real provider),
     then a pre-cached disk clip, then nothing. Voicing only — never deciding."""
     data = cached_voice(text) or _disk_voiceover(cache_name)
     if not data:
         return
-    st.audio(data["audio"], format=data["mime"])
+    st.audio(data["audio"], format=data["mime"], autoplay=autoplay)
     voice_suffix = f" · {data['voice']}" if data.get("voice") else ""
     st.caption(f"🔊 Narrated by {data['provider']}{voice_suffix} — voicing the explanation "
                "above, not deciding it.")
@@ -325,14 +337,16 @@ def _set_shock(magnitude: float, label: str) -> None:
 def _shock_reply(months, spot, curation, magnitude: float, label: str) -> str:
     """The assistant's chat reply: what the deterministic policy did with the shock.
     The number here is computed by the policy, not written by an LLM."""
-    baseline = quarter_hedge_ratio(decide_all(months, spot, DEFAULT_PARAMS)[:3])
-    outcome = run_shock(months, spot, curation, magnitude, label)
+    auto = standing_risk_premium(curation)  # the calm-path standing premium already in force
+    baseline = quarter_hedge_ratio(decide_all(months, spot, DEFAULT_PARAMS, risk_premium=auto)[:3])
+    outcome = run_shock(months, spot, curation, magnitude, label, base_risk_premium=auto)
     shocked = quarter_hedge_ratio(outcome.decisions[:3])
+    applied = outcome.decisions[0].risk_premium if outcome.decisions else outcome.risk_premium
     arrow = "up" if shocked > baseline else ("down" if shocked < baseline else "unchanged")
     return (
         f"**{label}** read as severity {magnitude:.0%}. I re-ran the deterministic policy: "
-        f"forward median lifts, the band widens, and a supply-risk premium of "
-        f"+{outcome.risk_premium:.0%} raises the lock floor.\n\n"
+        f"forward median lifts, the band widens, and the supply-risk premium rises to "
+        f"+{applied:.0%} on the lock floor.\n\n"
         f"Next-quarter hedge ratio moves **{baseline:.0%} → {shocked:.0%}** ({arrow}). "
         f"The charts and the driver mix on the left have updated; '{outcome.curation.kept[0].name}' "
         f"now leads the drivers. Say *calm* or hit Reset to return to the base case."
@@ -357,13 +371,125 @@ def _freeform_reply(message: str) -> str:
     )
 
 
+def _chat_state(months, spot, curation) -> voice_chat.ChatState:
+    """Build the grounded Q&A context from the CURRENT scenario state, mirroring the
+    calm/shock resolution in :func:`main` so a spoken answer matches the dashboard.
+    Read-only: it computes decisions for grounding, it never sets the ratio."""
+    auto = standing_risk_premium(curation)
+    magnitude = st.session_state.get("shock_magnitude", 0.0)
+    label = st.session_state.get("shock_label", "")
+    if magnitude > 0:
+        outcome = run_shock(months, spot, curation, magnitude, label, base_risk_premium=auto)
+        decisions = outcome.decisions
+        used = outcome.curation
+        applied_premium = decisions[0].risk_premium if decisions else outcome.risk_premium
+    else:
+        decisions = decide_all(months, spot, DEFAULT_PARAMS, risk_premium=auto)
+        used = curation
+        applied_premium = auto
+    return voice_chat.ChatState(
+        spot_price=spot,
+        decisions=decisions,
+        quarter_ratio=quarter_hedge_ratio(decisions[:3]),
+        kept_drivers=used.kept,
+        rejected_drivers=used.rejected,
+        standing_premium=applied_premium,
+        scenario_label=label,
+        scenario_magnitude=magnitude,
+    )
+
+
+def _route_chat_message(prompt: str, months, spot, curation, use_llm: bool,
+                        freeform: bool) -> tuple[str, str]:
+    """Route a chat message (typed OR transcribed) through the SAME branches and
+    return ``(reply_markdown, spoken_text)``. ``spoken_text`` is empty when there's
+    nothing worth reading aloud. The LLM only reads severity / explains — the
+    deterministic policy owns the ratio."""
+    request = parse_shock_request(prompt, use_llm=use_llm)
+    if request.is_shock:
+        _set_shock(request.magnitude, request.label)
+        reply = _shock_reply(months, spot, curation, request.magnitude, request.label)
+        return reply, ""  # the main body already narrates the shocked explanation
+    if freeform:
+        return _freeform_reply(prompt), "I re-selected the Sybilion filters from your request."
+    # Grounded question — answer from the current state without touching the shock.
+    answer = voice_chat.answer_question(prompt, _chat_state(months, spot, curation))
+    return answer.text, answer.text
+
+
+def _handle_voice_prompt(text: str, months, spot, curation, use_llm: bool,
+                         freeform: bool) -> None:
+    """Transcribed question → same routing as a typed message, then speak the reply
+    after the rerun (so the new transcript shows in the chat log first)."""
+    st.session_state.messages.append({"role": "user", "content": f"🎤 {text}"})
+    reply, spoken = _route_chat_message(text, months, spot, curation, use_llm, freeform)
+    st.session_state.messages.append({"role": "assistant", "content": reply})
+    st.session_state.pending_voice = spoken
+    st.rerun()
+
+
+def live_refresh_controls() -> None:
+    """Opt-in live Sybilion refresh — off by default.
+
+    OFF: the dashboard reads the pinned cached job (instant, offline, the same
+    numbers every run — the demo guarantee). ON + *Refresh now*: re-forecasts
+    against today's market into a **session-only** job; ``latest_job.txt`` stays
+    pinned, so toggling off restores the deterministic demo with no re-fetch.
+    """
+    have_key = config.have_sybilion_key()
+    st.toggle(
+        "Live Sybilion refresh",
+        value=False,
+        key="live_sybilion",
+        disabled=not have_key,
+        help=("OFF (default): the dashboard reads the cached forecast — instant, "
+              "offline, and the same numbers every run. ON: calls Sybilion live so "
+              "the forecast reflects today's market (needs SYBILION_API_KEY, takes "
+              "~10-60s, and the numbers will vary run to run)."),
+    )
+    if not have_key:
+        st.caption("Set `SYBILION_API_KEY` to enable live refresh.")
+        return
+
+    if st.session_state.get("live_sybilion"):
+        if st.button("Refresh now", use_container_width=True,
+                     help="Submit a fresh forecast to Sybilion and re-fetch its artifacts."):
+            try:
+                with st.spinner("Sybilion is forecasting against today's market… (~10-60s)"):
+                    selection = select_filters(DEFAULT_PERSONA)
+                    ttf = sc.load_ttf_series()
+                    payload = sc.build_forecast_payload(
+                        ttf["timeseries"],
+                        title=ttf.get("meta", {}).get("title") or sc.DEFAULT_SERIES_TITLE,
+                        keywords=selection.keywords,
+                        category_ids=selection.category_ids,
+                        region_codes=selection.region_codes,
+                    )
+                    new_job = sc.run_live_forecast(sc.SybilionClient(), payload)
+                st.session_state.live_job_id = new_job
+                st.session_state.live_job_fetched = pd.Timestamp.now().strftime("%H:%M:%S")
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 — surface and keep the cached job
+                st.error(f"Live refresh failed: {exc}. Showing the cached forecast.")
+
+        live_job = st.session_state.get("live_job_id")
+        if live_job:
+            fetched = st.session_state.get("live_job_fetched", "")
+            st.success(
+                f"Live forecast active — job `{live_job[:8]}…`"
+                + (f", fetched {fetched}" if fetched else "")
+                + ". Cached demo restored when you toggle off."
+            )
+
+
 def scenario_sidebar(months, spot, curation) -> None:
     """Live scenario controls + chat. Mutates ``st.session_state`` (shock magnitude
     + label + message log); the main body reads that state and re-renders."""
     with st.sidebar:
         st.header("Live scenario")
-        st.caption("Type a supply-shock headline and the agent re-decides on the spot — "
-                   "the LLM only reads the severity, the deterministic policy moves the ratio.")
+        st.caption("Type (or speak) a supply-shock headline and the agent re-decides on the "
+                   "spot — the LLM only reads the severity, the deterministic policy moves the "
+                   "ratio. Or just ask *why* — it explains the decision, never re-makes it.")
 
         active = st.session_state.shock_magnitude > 0
         button_cols = st.columns(2)
@@ -389,25 +515,51 @@ def scenario_sidebar(months, spot, curation) -> None:
         freeform = st.toggle("Free-form re-forecast (re-pick Sybilion filters)",
                              value=False, key="freeform_reforecast",
                              help="On: a non-shock message re-runs the keyword agent to "
-                                  "reconfigure Sybilion. Off (default): guided supply-shock only.")
+                                  "re-pick the Sybilion filters (no live forecast call — see "
+                                  "Data source for that). Off (default): guided supply-shock only.")
+
+        st.divider()
+        st.subheader("Data source")
+        live_refresh_controls()
 
         st.divider()
         for message in st.session_state.messages:
             st.chat_message(message["role"]).write(message["content"])
 
-        if prompt := st.chat_input("e.g. Iran closes the Strait of Hormuz"):
+        # Speak the most recent voice answer (queued on the prior run so the
+        # transcript renders first). Popped after playing so it never loops.
+        pending = st.session_state.pop("pending_voice", "")
+        if pending:
+            render_voiceover(pending, "chat", autoplay=True)
+
+        # Push-to-talk: record a question, transcribe it, then route it through the
+        # SAME branches a typed message hits. Hidden when no ASR backend is wired up,
+        # so the text chat and the no-keys demo are completely unchanged.
+        if transcribe.available():
+            audio = st.audio_input(
+                "🎤 Ask by voice",
+                key="voice_clip",
+                help="Record a question — 'why this hedge ratio?', 'which supplier "
+                     "matters most?'. It is transcribed, answered, and spoken back. "
+                     "Explanation only — it never changes the ratio.",
+            )
+            if audio is not None:
+                clip = audio.getvalue()
+                signature = hashlib.md5(clip).hexdigest() if clip else ""
+                if signature and signature != st.session_state.get("last_voice_sig"):
+                    st.session_state.last_voice_sig = signature
+                    with st.spinner("Transcribing…"):
+                        heard = transcribe.transcribe(clip)
+                    if heard:
+                        _handle_voice_prompt(heard, months, spot, curation, use_llm, freeform)
+                    else:
+                        st.warning("Couldn't transcribe that clip — try again or type your question.")
+        else:
+            st.caption("🎤 Voice input: add `HF_API_KEY` or `NVIDIA_ASR_FUNCTION_ID` to ask by voice.")
+
+        if prompt := st.chat_input("Ask 'why this ratio?' — or type a shock like 'Iran closes Hormuz'"):
             st.session_state.messages.append({"role": "user", "content": prompt})
-            request = parse_shock_request(prompt, use_llm=use_llm)
-            if request.is_shock:
-                _set_shock(request.magnitude, request.label)
-                reply = _shock_reply(months, spot, curation, request.magnitude, request.label)
-            elif freeform:
-                reply = _freeform_reply(prompt)
-            else:
-                _set_shock(0.0, "")
-                reply = ("No supply shock detected, so I'm showing the calm base case. "
-                         "Try something like *'Iran closes the Strait of Hormuz'* or "
-                         "*'new sanctions on Russian gas'* — or flip on free-form re-forecast.")
+            reply, _ = _route_chat_message(prompt, months, spot, curation, use_llm, freeform)
             st.session_state.messages.append({"role": "assistant", "content": reply})
             st.rerun()
 
@@ -418,7 +570,13 @@ def main() -> None:
                "lock in forward now, versus leave to spot? A decision built on the "
                "Sybilion forecast's confidence band — not its point estimate.")
 
-    job_id = sc.get_latest_job()
+    # Job resolution: the pinned demo job by default. A live Sybilion refresh
+    # (sidebar toggle, off by default) swaps in a freshly-fetched, session-only
+    # job — latest_job.txt stays pinned, so toggling off instantly restores the
+    # deterministic demo numbers with no re-fetch.
+    live_on = st.session_state.get("live_sybilion", False)
+    live_job = st.session_state.get("live_job_id")
+    job_id = live_job if (live_on and live_job) else sc.get_latest_job()
     if not job_id:
         st.error("No cached forecast found. Run a forecast first.")
         return
@@ -427,6 +585,13 @@ def main() -> None:
     months = sc.parse_forecast_months(forecast_json)
     spot = sc.last_actual_price(ttf)
     base_curation = curate_drivers(signals)
+    # Standing supply-risk premium — deterministic "dynamic weighting" from the live
+    # driver mix, fed through the SAME hedge_policy.risk_premium the shock uses (THE
+    # RULE holds: it is arithmetic on Sybilion importances, not an LLM). It lifts the
+    # calm lock when supply-risk-linked drivers dominate, and moves on its own as the
+    # mix shifts (e.g. after a live refresh).
+    auto_premium = standing_risk_premium(base_curation)
+    risk_share = risk_importance_share(base_curation)
     selection = cached_selection(DEFAULT_PERSONA)
 
     # Chat / scenario state. The sidebar mutates these; the body reads them.
@@ -441,12 +606,13 @@ def main() -> None:
     shock_active = magnitude > 0
     if shock_active:
         label = st.session_state.shock_label
-        shock = run_shock(months, spot, base_curation, magnitude, label)
+        shock = run_shock(months, spot, base_curation, magnitude, label,
+                          base_risk_premium=auto_premium)
         decisions = shock.decisions
         curation = shock.curation
         display_forecast_json = shock_forecast_json(forecast_json, magnitude)
     else:
-        decisions = decide_all(months, spot, DEFAULT_PARAMS)
+        decisions = decide_all(months, spot, DEFAULT_PARAMS, risk_premium=auto_premium)
         curation = base_curation
         display_forecast_json = forecast_json
 
@@ -460,12 +626,16 @@ def main() -> None:
                "policy sets the hedge ratio  →  Featherless explains it. The LLMs prepare and "
                "narrate; they never decide the ratio.")
 
-    calm_ratio = quarter_hedge_ratio(decide_all(months, spot, DEFAULT_PARAMS)[:3])
+    calm_ratio = quarter_hedge_ratio(
+        decide_all(months, spot, DEFAULT_PARAMS, risk_premium=auto_premium)[:3])
     if shock_active:
+        applied_premium = shock.decisions[0].risk_premium if shock.decisions else shock.risk_premium
+        standing_clause = (f" (standing +{auto_premium:.0%} plus the shock's +{shock.risk_premium:.0%})"
+                           if auto_premium > 0 else "")
         st.error(f"⚡ **Scenario active — {st.session_state.shock_label}** (severity {magnitude:.0%}). "
-                 f"Forward lifted, band widened, supply-risk premium +{shock.risk_premium:.0%} on the "
-                 "lock floor. Every panel below is the *same deterministic policy* re-run on the "
-                 "shocked inputs — use the sidebar to reset.")
+                 f"Forward lifted, band widened, supply-risk premium **+{applied_premium:.0%}** on the "
+                 f"lock floor{standing_clause}. Every panel below is the *same deterministic policy* "
+                 "re-run on the shocked inputs — use the sidebar to reset.")
 
     top = st.columns([1, 1, 1])
     top[0].metric(f"Lock now — next quarter ({quarter_label})", f"{quarter_ratio:.0%}",
@@ -474,6 +644,14 @@ def main() -> None:
     top[2].metric("Forecast point-accuracy (backtest MAPE)", f"{mape:.0f}%",
                   help="The point forecast is weak, which is exactly why the decision "
                        "is built on the confidence band and drivers instead.")
+
+    if auto_premium > 0:
+        st.caption(
+            f"📌 **Standing supply-risk premium +{auto_premium:.0%}** baked into the lock floor — "
+            f"supply-risk-linked drivers (Russia / Iran / Qatar / Algeria pipelines & LNG, plus any "
+            f"global-risk & volatility signals) make up **{risk_share:.0%}** of kept-driver importance. "
+            "Deterministic weighting from the live driver mix — not the point forecast — so it moves on "
+            "its own as the mix shifts; every month's row below carries it in the trace.")
 
     with st.expander(f"Step 1 — how the agent configured the forecast  ·  "
                      f"Featherless {KEYWORD_MODEL.split('/')[-1]}  ·  source: {selection.source}"):

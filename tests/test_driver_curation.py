@@ -7,6 +7,7 @@ and the kept-count threshold is what trips the keyword agent's refine loop.
 
 from gas_agent.driver_curation import (
     DEFAULT_CURATION_PARAMS,
+    GLOBAL_RISK_THEME,
     CurationParams,
     classify_driver,
     curate_drivers,
@@ -121,3 +122,45 @@ def test_top_drivers_dedupes_by_name():
     top = result.top_drivers(3, unique_names=True)
     assert len(top) == 2
     assert len({d.name for d in top}) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Future-proof whitelist keywords (edges.md) — Brent, global-risk/volatility,
+# and macro indicators classify as credible the day Sybilion surfaces them.
+# --------------------------------------------------------------------------- #
+def test_brent_is_kept_as_oil():
+    # "Brent" with no other oil cue must still match via the new keyword.
+    verdict, theme, _ = classify_driver("Brent front-month settlement")
+    assert verdict == "keep"
+    assert theme == "oil & petroleum products"
+
+
+def test_vix_is_kept_as_global_risk():
+    verdict, theme, _ = classify_driver("VIX volatility index")
+    assert verdict == "keep"
+    assert theme == GLOBAL_RISK_THEME
+
+
+def test_geopolitical_risk_index_is_kept_as_global_risk():
+    verdict, theme, _ = classify_driver("Global risk indicator - World")
+    assert verdict == "keep"
+    assert theme == GLOBAL_RISK_THEME
+
+
+def test_pmi_is_kept_as_macro_indicator():
+    verdict, theme, _ = classify_driver("Eurozone Manufacturing PMI")
+    assert verdict == "keep"
+    assert theme == "macro indicators"
+
+
+def test_inflation_is_kept_as_macro_indicator():
+    verdict, theme, _ = classify_driver("Inflation rate - euro area")
+    assert verdict == "keep"
+    assert theme == "macro indicators"
+
+
+def test_consumer_price_does_not_collide_with_producer_prices():
+    # The macro "consumer price" keyword must not be swallowed by, or swallow, the
+    # distinct "producer & import prices" theme.
+    assert classify_driver("Consumer price index - euro area")[1] == "macro indicators"
+    assert classify_driver("Domestic producer prices in Germany")[1] == "producer & import prices"

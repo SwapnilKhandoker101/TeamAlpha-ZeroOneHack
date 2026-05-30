@@ -16,6 +16,13 @@ dependencies = [
     "pytest>=8.3",
 ]
 
+[project.optional-dependencies]
+# NVIDIA Riva voice (TTS + ASR) over NVCF gRPC. Optional on purpose: the code
+# imports it lazily and degrades to the local `say` voice / text-only when it is
+# absent, so the demo still runs with no extra install. Enable the NVIDIA voice
+# path with:  uv run --extra voice streamlit run app.py
+voice = ["nvidia-riva-client>=2.14"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
