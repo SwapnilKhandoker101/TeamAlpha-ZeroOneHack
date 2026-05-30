@@ -1,0 +1,341 @@
+{
+  "meta": {
+    "source": "mock",
+    "built_from_gas_job": "f445eec1-62e2-43e1-9995-18ba7ee668c3",
+    "units": {
+      "gas": "EUR/MWh",
+      "clay": "EUR/kg",
+      "power": "EUR/kWh",
+      "shipping": "EUR/kg"
+    },
+    "note": "Deterministic ceramics 4-factor mock. Gas = real cached TTF band; clay/power/shipping = seasonal mock. Regenerate via scripts/build_ceramics_forecast.py."
+  },
+  "factors": {
+    "gas": {
+      "forecast_series": {
+        "2026-06-01": {
+          "quantile_forecast": {
+            "0.05": 6.4207,
+            "0.10": 28.6558,
+            "0.50": 42.6083,
+            "0.90": 56.5609,
+            "0.95": 78.7959
+          },
+          "forecast": 42.6083
+        },
+        "2026-07-01": {
+          "quantile_forecast": {
+            "0.05": 2.2019,
+            "0.10": 17.7783,
+            "0.50": 34.5938,
+            "0.90": 51.4093,
+            "0.95": 66.9857
+          },
+          "forecast": 34.5938
+        },
+        "2026-08-01": {
+          "quantile_forecast": {
+            "0.05": 10.4897,
+            "0.10": 24.2479,
+            "0.50": 41.1898,
+            "0.90": 58.1318,
+            "0.95": 71.8899
+          },
+          "forecast": 41.1898
+        },
+        "2026-09-01": {
+          "quantile_forecast": {
+            "0.05": 7.3982,
+            "0.10": 19.0035,
+            "0.50": 35.0981,
+            "0.90": 51.1927,
+            "0.95": 62.7979
+          },
+          "forecast": 35.0981
+        },
+        "2026-10-01": {
+          "quantile_forecast": {
+            "0.05": 4.99,
+            "0.10": 15.1931,
+            "0.50": 32.7718,
+            "0.90": 50.3505,
+            "0.95": 60.5537
+          },
+          "forecast": 32.7718
+        },
+        "2026-11-01": {
+          "quantile_forecast": {
+            "0.05": -56.7775,
+            "0.10": 5.7953,
+            "0.50": 26.2867,
+            "0.90": 46.7782,
+            "0.95": 109.351
+          },
+          "forecast": 26.2867
+        }
+      }
+    },
+    "clay": {
+      "forecast_series": {
+        "2026-06-01": {
+          "quantile_forecast": {
+            "0.05": 0.1627,
+            "0.10": 0.1692,
+            "0.50": 0.18,
+            "0.90": 0.1908,
+            "0.95": 0.1973
+          },
+          "forecast": 0.18
+        },
+        "2026-07-01": {
+          "quantile_forecast": {
+            "0.05": 0.1634,
+            "0.10": 0.1699,
+            "0.50": 0.1807,
+            "0.90": 0.1916,
+            "0.95": 0.1981
+          },
+          "forecast": 0.1807
+        },
+        "2026-08-01": {
+          "quantile_forecast": {
+            "0.05": 0.164,
+            "0.10": 0.1706,
+            "0.50": 0.1814,
+            "0.90": 0.1923,
+            "0.95": 0.1989
+          },
+          "forecast": 0.1814
+        },
+        "2026-09-01": {
+          "quantile_forecast": {
+            "0.05": 0.1647,
+            "0.10": 0.1712,
+            "0.50": 0.1822,
+            "0.90": 0.1931,
+            "0.95": 0.1996
+          },
+          "forecast": 0.1822
+        },
+        "2026-10-01": {
+          "quantile_forecast": {
+            "0.05": 0.1686,
+            "0.10": 0.1753,
+            "0.50": 0.1865,
+            "0.90": 0.1977,
+            "0.95": 0.2044
+          },
+          "forecast": 0.1865
+        },
+        "2026-11-01": {
+          "quantile_forecast": {
+            "0.05": 0.1693,
+            "0.10": 0.176,
+            "0.50": 0.1873,
+            "0.90": 0.1985,
+            "0.95": 0.2053
+          },
+          "forecast": 0.1873
+        }
+      }
+    },
+    "power": {
+      "forecast_series": {
+        "2026-06-01": {
+          "quantile_forecast": {
+            "0.05": 0.1305,
+            "0.10": 0.1421,
+            "0.50": 0.1615,
+            "0.90": 0.1809,
+            "0.95": 0.1925
+          },
+          "forecast": 0.1615
+        },
+        "2026-07-01": {
+          "quantile_forecast": {
+            "0.05": 0.1309,
+            "0.10": 0.1425,
+            "0.50": 0.162,
+            "0.90": 0.1814,
+            "0.95": 0.1931
+          },
+          "forecast": 0.162
+        },
+        "2026-08-01": {
+          "quantile_forecast": {
+            "0.05": 0.1313,
+            "0.10": 0.143,
+            "0.50": 0.1625,
+            "0.90": 0.182,
+            "0.95": 0.1937
+          },
+          "forecast": 0.1625
+        },
+        "2026-09-01": {
+          "quantile_forecast": {
+            "0.05": 0.1317,
+            "0.10": 0.1434,
+            "0.50": 0.163,
+            "0.90": 0.1825,
+            "0.95": 0.1942
+          },
+          "forecast": 0.163
+        },
+        "2026-10-01": {
+          "quantile_forecast": {
+            "0.05": 0.1599,
+            "0.10": 0.1741,
+            "0.50": 0.1978,
+            "0.90": 0.2216,
+            "0.95": 0.2358
+          },
+          "forecast": 0.1978
+        },
+        "2026-11-01": {
+          "quantile_forecast": {
+            "0.05": 0.1603,
+            "0.10": 0.1746,
+            "0.50": 0.1984,
+            "0.90": 0.2222,
+            "0.95": 0.2365
+          },
+          "forecast": 0.1984
+        }
+      }
+    },
+    "shipping": {
+      "forecast_series": {
+        "2026-06-01": {
+          "quantile_forecast": {
+            "0.05": 0.0912,
+            "0.10": 0.102,
+            "0.50": 0.12,
+            "0.90": 0.138,
+            "0.95": 0.1488
+          },
+          "forecast": 0.12
+        },
+        "2026-07-01": {
+          "quantile_forecast": {
+            "0.05": 0.0958,
+            "0.10": 0.1071,
+            "0.50": 0.126,
+            "0.90": 0.1449,
+            "0.95": 0.1562
+          },
+          "forecast": 0.126
+        },
+        "2026-08-01": {
+          "quantile_forecast": {
+            "0.05": 0.0958,
+            "0.10": 0.1071,
+            "0.50": 0.126,
+            "0.90": 0.1449,
+            "0.95": 0.1562
+          },
+          "forecast": 0.126
+        },
+        "2026-09-01": {
+          "quantile_forecast": {
+            "0.05": 0.0958,
+            "0.10": 0.1071,
+            "0.50": 0.126,
+            "0.90": 0.1449,
+            "0.95": 0.1562
+          },
+          "forecast": 0.126
+        },
+        "2026-10-01": {
+          "quantile_forecast": {
+            "0.05": 0.1094,
+            "0.10": 0.1224,
+            "0.50": 0.144,
+            "0.90": 0.1656,
+            "0.95": 0.1786
+          },
+          "forecast": 0.144
+        },
+        "2026-11-01": {
+          "quantile_forecast": {
+            "0.05": 0.1094,
+            "0.10": 0.1224,
+            "0.50": 0.144,
+            "0.90": 0.1656,
+            "0.95": 0.1786
+          },
+          "forecast": 0.144
+        }
+      }
+    }
+  },
+  "external_drivers": {
+    "gas": [
+      {
+        "name": "Dutch TTF front-month futures (ICE Endex)",
+        "importance": 92.0,
+        "source": "ICE / Yahoo TTF=F"
+      },
+      {
+        "name": "EU gas storage fill level",
+        "importance": 74.0,
+        "source": "GIE AGSI+"
+      },
+      {
+        "name": "Norwegian pipeline flows to the EU",
+        "importance": 61.0,
+        "source": "ENTSOG"
+      }
+    ],
+    "clay": [
+      {
+        "name": "IMF kaolin & clay price index",
+        "importance": 70.0,
+        "source": "IMF Primary Commodity Prices"
+      },
+      {
+        "name": "PPI: kaolin & ball clay mining",
+        "importance": 58.0,
+        "source": "FRED / BLS PPI"
+      },
+      {
+        "name": "World clay & kaolin output",
+        "importance": 44.0,
+        "source": "World Mineral Statistics (BGS)"
+      }
+    ],
+    "power": [
+      {
+        "name": "EU wholesale day-ahead electricity price",
+        "importance": 80.0,
+        "source": "ENTSO-E Transparency"
+      },
+      {
+        "name": "EU electricity price index",
+        "importance": 66.0,
+        "source": "Eurostat"
+      },
+      {
+        "name": "Heating-degree-days demand proxy",
+        "importance": 49.0,
+        "source": "Copernicus / Eurostat"
+      }
+    ],
+    "shipping": [
+      {
+        "name": "Baltic Dry Index",
+        "importance": 77.0,
+        "source": "Baltic Exchange"
+      },
+      {
+        "name": "EU freight transport cost index",
+        "importance": 59.0,
+        "source": "Eurostat"
+      },
+      {
+        "name": "Road & container freight benchmark",
+        "importance": 42.0,
+        "source": "Eurostat COMEXT proxy"
+      }
+    ]
+  }
+}

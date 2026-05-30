@@ -564,7 +564,7 @@ def scenario_sidebar(months, spot, curation) -> None:
             st.rerun()
 
 
-def main() -> None:
+def render_gas_tab() -> None:
     st.title("European gas (TTF) hedging agent")
     st.caption("How much of next quarter's gas should an energy-intensive EU buyer "
                "lock in forward now, versus leave to spot? A decision built on the "
@@ -773,6 +773,19 @@ def main() -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption(f"Forecast job {job_id} — cached real Sybilion output. "
                "The hedge ratio is computed by deterministic code, not an LLM.")
+
+
+def main() -> None:
+    """Two decision agents, one app. The gas tab is the original dashboard,
+    unchanged; the ceramics tab is the second agent. The sidebar (gas shock
+    scenario + voice) stays global — it is rendered inside the gas tab body."""
+    tab_gas, tab_cer = st.tabs(["Gas hedging", "Ceramics optimizer"])
+    with tab_gas:
+        render_gas_tab()
+    with tab_cer:
+        from ceramics_agent.dashboard import render_ceramics_tab
+
+        render_ceramics_tab(render_voiceover)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,30 @@ HF_BASE_URL = os.getenv("HF_BASE_URL", "https://api-inference.huggingface.co")
 HF_ASR_MODEL = os.getenv("HF_ASR_MODEL", "openai/whisper-large-v3")
 
 
+# --------------------------------------------------------------------------- #
+# Ceramics supply-chain optimizer (the second decision agent). Additive only —
+# the gas agent never reads these. Defaults keep the ceramics tab fully
+# deterministic and offline, mirroring the gas demo's "runs with no keys" rule.
+# --------------------------------------------------------------------------- #
+# Starting cost-factor weights for the ceramics lock decision (sum to 1.0). The
+# UI lets the user re-weight; these are the calm defaults — gas-dominant, because
+# firing gas is the largest volatile cost for the persona.
+CERAMICS_DEFAULT_WEIGHTS: dict[str, float] = {
+    "gas": 0.40,
+    "clay": 0.35,
+    "energy": 0.15,
+    "transport": 0.10,
+}
+
+# Seed for the "random" backtest baseline. Seeded so the random strategy
+# reproduces run to run — determinism is the selling point, even for the foil.
+CERAMICS_BACKTEST_SEED = 7
+
+# Committed mock 4-factor forecast — the ceramics demo's source of truth, the
+# analogue of the cached gas job. Regenerate with scripts/build_ceramics_forecast.py.
+CERAMICS_MOCK_FORECAST = CACHE_DIR / "mock_ceramics_forecast.json"
+
+
 def have_sybilion_key() -> bool:
     return bool(SYBILION_API_KEY)
 

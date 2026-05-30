@@ -33,6 +33,22 @@ The three hackathon judging axes the build targets:
 2. **Traceable reasoning** — every number in the decision is exposed; LLMs only narrate.
 3. **Adaptive when an assumption shifts** — the live supply-shock scenario.
 
+### A second decision agent — ceramics supply-chain optimizer
+
+The same spine now powers a **second** agent, in a second Streamlit tab, for the
+same manufacturer's **ceramics** line. For one production run (product / quantity /
+timeline) under user-set cost-factor weights (gas / clay / power / transport) it
+decides three things — **how much input cost to lock now**, **which supplier to buy
+from**, and **which channel to sell through** — then runs a two-round negotiation
+and a 3-strategy backtest. The "lock %" is literally a hedge ratio on a *blended*
+4-factor cost band, so it **reuses `gas_agent.hedge_policy` unchanged**
+(`HedgePolicyParams(low_band=0.25, high_band=0.60)`). Same invariants: deterministic
+& auditable (the LLM only explains, never computes a number), offline-first
+(committed mock forecast + template narrative), and **the gas tab stays
+byte-identical**. Lives in its own `ceramics_agent/` package (mirrors `gas_agent/`);
+the only `app.py` change wraps the original dashboard body in tabs. See §5 for live
+numbers and `docs/CERAMICS_AGENT.md` for the design note.
+
 ---
 
 ## 2. Hard invariants — DO NOT BREAK THESE
@@ -72,6 +88,7 @@ hackathon/
 │   └── ttf_series.json          # committed monthly TTF history (the spot anchor)
 ├── cache/
 │   ├── latest_job.txt           # → f445eec1-62e2-43e1-9995-18ba7ee668c3
+│   ├── mock_ceramics_forecast.json  # committed 4-factor ceramics mock (the offline demo source)
 │   ├── <job_id>/                # cached real Sybilion artifacts (gitignored *.json)
 │   │   ├── forecast.json
 │   │   ├── external_signals.json
@@ -94,14 +111,26 @@ hackathon/
 │   ├── geo.py                   # country coords + aggregation + per-country brief
 │   ├── sybilion_client.py       # REST client + disk cache + artifact parsers
 │   └── voice.py                 # TTS: NVIDIA Riva primary + rate limiter + local `say` fallback
+├── ceramics_agent/              # SECOND AGENT — mirrors gas_agent/ (gas stays untouched)
+│   ├── catalog.py               # products (BOM), suppliers, channels, historical sales + whitelists
+│   ├── forecast.py              # 4-factor cost-forecast loader (mock default; live Sybilion opt-in)
+│   ├── cost_policy.py           # blended cost band → lock % (REUSES gas_agent.hedge_policy)
+│   ├── curation.py              # deterministic keep/reject + score/rank of suppliers & channels
+│   ├── negotiation.py           # two-round, market-anchored negotiation (deterministic)
+│   ├── backtest.py              # 3-strategy replay (agent vs seeded-random vs cheap+best-margin)
+│   ├── recommend.py             # orchestrates forecast→lock→curation→negotiation→backtest (pure)
+│   ├── explanation.py           # LLM narrates the decided recommendation (explain-only; template fallback)
+│   └── dashboard.py             # render_ceramics_tab(render_voiceover) — the second tab UI
 ├── scripts/
 │   ├── build_ttf_series.py      # regenerate data/ttf_series.json from Yahoo TTF=F
 │   ├── save_cached_artifact.py  # import an MCP-exported artifact into cache/<job>/
-│   └── build_voiceover.py       # pre-synthesise cache/audio/{golden,shock}.wav
-├── tests/                       # 82 tests, all green (pytest)
+│   ├── build_voiceover.py       # pre-synthesise cache/audio/{golden,shock}.wav
+│   └── build_ceramics_forecast.py   # generate & commit cache/mock_ceramics_forecast.json
+├── tests/                       # 179 tests, all green (111 gas + 68 ceramics)
 └── docs/
     ├── APP_GUIDE.md             # user guide (how it works, how we know it's good)
-    └── ARCHITECTURE.md          # build & design-rationale (why each choice)
+    ├── ARCHITECTURE.md          # build & design-rationale (why each choice)
+    └── CERAMICS_AGENT.md        # the second agent — design note + live numbers
 ```
 
 ---
@@ -111,10 +140,11 @@ hackathon/
 ```bash
 uv sync                              # install deps
 cp .env.example .env                 # optional: add real keys (demo runs without them)
-uv run streamlit run app.py          # the dashboard
-uv run pytest -q                     # 82 tests, all pass
-uv run python -m gas_agent.decision_backtest   # offline backtest verdict
+uv run streamlit run app.py          # the dashboard (Gas hedging + Ceramics optimizer tabs)
+uv run pytest -q                     # 179 tests, all pass (111 gas + 68 ceramics)
+uv run python -m gas_agent.decision_backtest   # offline backtest verdict (gas)
 uv run python scripts/build_voiceover.py       # regenerate narration into cache/audio/
+uv run python scripts/build_ceramics_forecast.py  # regenerate the committed ceramics mock
 ```
 
 - **uv** is the package manager. Python ≥ 3.11 (dev on 3.13).
@@ -126,7 +156,7 @@ uv run python scripts/build_voiceover.py       # regenerate narration into cache
 ## 5. Current state (as of 2026-05-30)
 
 **Everything in the original 13-task plan is built and verified.** All three judging
-axes are covered. **111 tests pass.**
+axes are covered. **179 tests pass** (111 gas + 68 ceramics).
 
 A second wave (the `edges.md` follow-up) is also built and verified:
 1. **Future-proof whitelist keywords** — `driver_curation` now recognises Brent,
@@ -162,19 +192,58 @@ they haven't regressed the decision):
 | Backtest | **63 replayed months** (premium-free): policy €1.25/MWh **cheaper** than spot, €2.34/MWh **tighter** swing, **matches** a 50% lock (policy €35.71±4.47; spot €36.96±6.81; lock-50% €35.25±4.35) |
 | Shock (magnitude 1.0) | next-quarter ratio **rises** to **~40.1%** vs the new calm 30.5% (applied premium +32%); Iran/risk supplier lights up green on the globe; "Global supply-risk premium" leads the drivers |
 
-### Git state — IMPORTANT
-The working tree is **ahead of the last commit** (`base`, `3fda01c`) and the
-`edges.md` follow-up wave is **uncommitted**:
-- **Modified:** `app.py` (live-refresh toggle + standing-premium wiring + push-to-talk
-  mic), `gas_agent/config.py` (ASR/HF config), `gas_agent/driver_curation.py`
-  (future-proof keywords), `gas_agent/scenario.py` (standing premium), 
-  `gas_agent/sybilion_client.py` (live forecast orchestration), `.env.example`,
-  `pyproject.toml` + `uv.lock` (optional `voice` extra), `tests/test_driver_curation.py`,
-  `tests/test_scenario.py`, `CLAUDE.md`.
-- **Untracked:** `gas_agent/transcribe.py`, `gas_agent/voice_chat.py`,
-  `tests/test_sybilion_client.py`, `tests/test_transcribe.py`, `tests/test_voice_chat.py`.
+### Ceramics optimizer (second agent) — built & verified
 
-Do not commit unless asked; if asked, stage named files (never `.env`).
+The full C1–C8 build is done: `catalog` (BOM products, suppliers, channels,
+historical sales) → `forecast` (4-factor loader, mock default + live Sybilion
+opt-in) → `cost_policy` (blended band → lock %, reusing `gas_agent.hedge_policy`) →
+`curation` (score/rank suppliers & channels) → `negotiation` (two rounds) →
+`backtest` (3 strategies) → `recommend` (orchestrator) → `explanation` (explain-only
+LLM + template) → `dashboard` (the second tab). It runs fully offline on the
+committed `cache/mock_ceramics_forecast.json`; the live 4-factor path is behind the
+`SYBILION_API_KEY` guard and **never** repoints `latest_job.txt`. Verified end-to-end
+in the browser: both tabs render, **the gas tab is byte-identical**, zero Streamlit
+exceptions, and identical inputs yield identical numbers.
+
+Default landing view — **Handmade Bowl / 5,000 units / 14-day timeline / medium
+competition** / default weights (gas 40% · clay 35% · energy 15% · transport 10%),
+mock forecast, so a future session can sanity-check the decision hasn't regressed:
+
+| Quantity | Value |
+|----------|-------|
+| Forecast | 4 factors (gas / clay / power / shipping) × 6 months (2026-06 … 2026-11), `source = "mock"` |
+| **Lock now (next-quarter input cost)** | **40%** — blended cost band **43% (moderate)** → "mid lock, balanced mid-ranked supplier" |
+| Physical unit cost | ≈ **€0.75/unit** (median, from BOM × the 4 factor bands) |
+| Suppliers (kept / ranked) | Eastern European Materials **98** (cost 100 · rel 92 · lead 100) · **Alpine Clay Works 72** ✅ chosen (cost 67 · rel 96 · lead 50) · Premium Ceramics Supply **44** |
+| Channels (kept / ranked) | **Online Retail Export 87** ✅ chosen (margin 100 · season 56 · order-fit 100) · Hospitality & Restaurant Supply **73** |
+| **Negotiated deal** | buy from Alpine at **€0.86/unit**, sell via Online at **€1.51/unit** → unit margin **€0.65**, **€3,253 total** (× 5,000) |
+| **Backtest (12 replayed months)** | agent **€34,290/mo** realized margin — **+65%** vs a seeded-random pick (€20,792), **+1%** vs static cheap+best-margin (€33,819) |
+
+Note: the chosen supplier is the **mid-ranked** Alpine (not the top-scored Eastern)
+**by design** — a 40% lock falls in the "mid lock" band, which routes to the balanced
+mid-ranked supplier (`select_supplier`). High lock → top-ranked; low lock → cheapest.
+The backtest discounts each supplier's nominal margin by its reliability (a stated
+assumption); the random baseline is seeded (`config.CERAMICS_BACKTEST_SEED = 7`) so it
+reproduces run-to-run. Ceramics **maximizes** margin (higher = better), unlike the gas
+agent which minimizes cost variance.
+
+### Git state — IMPORTANT
+The `edges.md` follow-up wave is now **committed** (HEAD = `16dc100 voice chat`).
+The working tree is **ahead of HEAD** with the **entire ceramics agent uncommitted**:
+- **Modified:** `app.py` (wrap the original `main()` body — renamed `render_gas_tab()` —
+  in `st.tabs([...])`; the gas tab content is unchanged), `gas_agent/config.py`
+  (additive ceramics constants: `CERAMICS_DEFAULT_WEIGHTS`, `CERAMICS_BACKTEST_SEED`,
+  `CERAMICS_MOCK_FORECAST`), `.gitignore` (negation so the committed mock forecast is
+  trackable), `CLAUDE.md`.
+- **Untracked (this build):** the whole `ceramics_agent/` package (9 modules),
+  `cache/mock_ceramics_forecast.json` (the committed offline demo source),
+  `scripts/build_ceramics_forecast.py`, `docs/CERAMICS_AGENT.md`, and the 8
+  `tests/test_ceramics_*.py` files.
+- **Untracked (pre-existing scratch, NOT part of this work):** `scripts/get_drivers.py`,
+  `scripts/get_drivers.md`.
+
+No `gas_agent/` module was touched (gas stays frozen). Do not commit unless asked; if
+asked, stage named files (never `.env`, never the scratch above).
 
 ---
 

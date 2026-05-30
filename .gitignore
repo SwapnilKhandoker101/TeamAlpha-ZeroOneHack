@@ -12,6 +12,8 @@ venv/
 # Sybilion artifact cache (regenerable from job IDs)
 cache/*.json
 cache/**/*.json
+# ...but the ceramics mock forecast IS the committed offline demo source — keep it.
+!cache/mock_ceramics_forecast.json
 
 # Pre-synthesised narration (regenerable: scripts/build_voiceover.py)
 cache/audio/
