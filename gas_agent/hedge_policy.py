@@ -73,6 +73,7 @@ class MonthDecision:
     band_regime: str  # "tight" | "moderate" | "wide"
     direction: str  # "rising" | "falling" | "flat"
     reason: str  # one-line human-readable trace
+    risk_premium: float = 0.0  # supply-shock add-on (0 in calm conditions; set by scenario.py)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -102,12 +103,18 @@ def decide_month(
     forecast: MonthForecast,
     spot_price: float,
     params: HedgePolicyParams = DEFAULT_PARAMS,
+    risk_premium: float = 0.0,
 ) -> MonthDecision:
     """Compute the hedge ratio for a single month.
 
     ``spot_price`` is today's observed price. The drift compares this month's
     forecast median to that spot: a forward above spot means buying later is
     expected to cost more (tilt toward locking), below spot the reverse.
+
+    ``risk_premium`` is an additive supply-shock add-on (default 0). It is set by
+    :mod:`gas_agent.scenario` when a credible Global-risk driver becomes dominant,
+    raising the lock floor to buy insurance against a supply tail. It is still the
+    deterministic policy — not an LLM — that turns the premium into a ratio.
     """
     band_width = (forecast.high - forecast.low) / forecast.median
 
@@ -119,13 +126,17 @@ def decide_month(
     drift_pct = (forecast.median - spot_price) / spot_price
     direction_tilt = clamp(drift_pct * params.tilt_gain, -params.max_tilt, params.max_tilt)
 
-    hedge_ratio = clamp(ratio_from_band + direction_tilt, params.min_hedge, params.max_hedge)
+    hedge_ratio = clamp(
+        ratio_from_band + direction_tilt + risk_premium, params.min_hedge, params.max_hedge
+    )
 
     band_regime = _classify_band(band_width, params)
     direction = _classify_direction(drift_pct)
+    risk_clause = f"+ supply-risk premium (+{risk_premium:.0%}) " if risk_premium else ""
     reason = (
         f"{band_regime} band ({band_width:.0%} of median) "
         f"+ median {direction} vs spot ({drift_pct:+.0%}) "
+        f"{risk_clause}"
         f"-> lock {hedge_ratio:.0%}"
     )
 
@@ -142,6 +153,7 @@ def decide_month(
         band_regime=band_regime,
         direction=direction,
         reason=reason,
+        risk_premium=risk_premium,
     )
 
 
@@ -149,9 +161,10 @@ def decide_all(
     forecasts: list[MonthForecast],
     spot_price: float,
     params: HedgePolicyParams = DEFAULT_PARAMS,
+    risk_premium: float = 0.0,
 ) -> list[MonthDecision]:
     """Decide every forecast month, each compared against today's spot price."""
-    return [decide_month(forecast, spot_price, params) for forecast in forecasts]
+    return [decide_month(forecast, spot_price, params, risk_premium) for forecast in forecasts]
 
 
 def quarter_hedge_ratio(decisions: list[MonthDecision]) -> float:
