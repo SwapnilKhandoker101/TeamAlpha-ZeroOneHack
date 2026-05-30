@@ -13,6 +13,9 @@ venv/
 cache/*.json
 cache/**/*.json
 
+# Pre-synthesised narration (regenerable: scripts/build_voiceover.py)
+cache/audio/
+
 # OS
 .DS_Store
 .claude/

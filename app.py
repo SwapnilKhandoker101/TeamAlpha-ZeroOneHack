@@ -15,6 +15,7 @@ import streamlit as st
 
 from gas_agent import geo
 from gas_agent import sybilion_client as sc
+from gas_agent import voice
 from gas_agent.config import EXPLANATION_MODEL, KEYWORD_MODEL
 from gas_agent.decision_backtest import backtest_from_cache
 from gas_agent.driver_curation import curate_drivers
@@ -95,6 +96,48 @@ def cached_country_brief(region: str, kept_names: tuple[str, ...], credible: boo
     """Per-country brief. Cached by country + drivers + credibility so the Featherless
     call runs once per country. Pure explanation — never a decision."""
     return geo.country_brief(region, list(kept_names), credible)
+
+
+@st.cache_data(show_spinner="Synthesising narration…")
+def cached_voice(text: str):
+    """Voice the explanation once per unique text. Returns a plain dict (so it
+    caches cleanly) or None when no TTS provider is reachable. The NVIDIA free-tier
+    limiter inside voice.synthesize routes to Featherless when needed."""
+    clip = voice.synthesize(text)
+    if clip is None:
+        return None
+    return {"audio": clip.audio_bytes, "mime": clip.mime,
+            "provider": clip.provider, "voice": clip.voice}
+
+
+def _disk_voiceover(name: str):
+    """Fall back to a pre-synthesised clip from cache/audio/ (written by
+    scripts/build_voiceover.py) so the demo has audio even if live TTS is down."""
+    from gas_agent import config as _config
+    sidecar = _config.CACHE_DIR / "audio" / f"{name}.json"
+    if not sidecar.exists():
+        return None
+    try:
+        import json
+        meta = json.loads(sidecar.read_text())
+        audio_path = _config.CACHE_DIR / "audio" / meta["file"]
+        return {"audio": audio_path.read_bytes(), "mime": meta["mime"],
+                "provider": meta.get("provider", "cache"), "voice": meta.get("voice", "")}
+    except Exception:
+        return None
+
+
+def render_voiceover(text: str, cache_name: str) -> None:
+    """Play a narration of ``text`` under the explanation: live synthesis first
+    (so the audio matches the words and the caption names the real provider),
+    then a pre-cached disk clip, then nothing. Voicing only — never deciding."""
+    data = cached_voice(text) or _disk_voiceover(cache_name)
+    if not data:
+        return
+    st.audio(data["audio"], format=data["mime"])
+    voice_suffix = f" · {data['voice']}" if data.get("voice") else ""
+    st.caption(f"🔊 Narrated by {data['provider']}{voice_suffix} — voicing the explanation "
+               "above, not deciding it.")
 
 
 def price_band_figure(ttf: dict, forecast_json: dict, history_months: int = 30) -> go.Figure:
@@ -215,65 +258,59 @@ def curation_figure(curation, top_kept: int = 12) -> go.Figure:
     return figure
 
 
-# Natural Earth coastlines give the globe a surface; columns/markers ride on top.
-_GLOBE_BASEMAP = ("https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/"
-                  "ne_50m_admin_0_scale_rank.geojson")
-
-
-def globe_deck(countries) -> pdk.Deck:
-    """A 3D globe: green columns for the credible supplier/hub countries (taller =
-    more kept importance) and flat red markers for the spurious-only countries."""
+def globe_figure(countries) -> go.Figure:
+    """A drag-spinnable orthographic globe: green markers for the credible
+    supplier/hub countries (bigger = more kept importance) and red markers for
+    the spurious-only countries. Plotly's built-in country geometry draws the
+    land, so there is no external basemap fetch to fail on stage."""
     kept = [c for c in countries if c.has_kept]
     rejected = [c for c in countries if c.rejected_only]
-    max_importance = max((c.kept_importance for c in kept), default=1.0)
-    elevation_scale = 600_000 / max_importance  # tallest column ≈ 600 km, readable on the sphere
-
-    kept_df = pd.DataFrame([{
-        "region": c.region, "lon": c.lon, "lat": c.lat,
-        "kept_importance": round(c.kept_importance, 1), "kept_count": c.kept_count,
-        "rejected_count": c.rejected_count,
-        "tip": f"{c.region}  ·  {c.kept_count} kept driver(s)  ·  importance {c.kept_importance:.0f}",
-    } for c in kept])
-    rejected_df = pd.DataFrame([{
-        "region": c.region, "lon": c.lon, "lat": c.lat,
-        "kept_count": 0, "rejected_count": c.rejected_count,
-        "tip": f"{c.region}  ·  {c.rejected_count} spurious driver(s) dropped",
-    } for c in rejected])
-
-    layers = [
-        pdk.Layer("GeoJsonLayer", id="basemap", data=_GLOBE_BASEMAP, stroked=False,
-                  filled=True, get_fill_color=[40, 48, 66], get_line_color=[20, 24, 34]),
-    ]
-    if not kept_df.empty:
-        layers.append(pdk.Layer(
-            "ColumnLayer", id="kept", data=kept_df, get_position=["lon", "lat"],
-            get_elevation="kept_importance", elevation_scale=elevation_scale,
-            radius=90_000, get_fill_color=[22, 163, 74, 220], pickable=True, auto_highlight=True))
-    if not rejected_df.empty:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer", id="rejected", data=rejected_df, get_position=["lon", "lat"],
-            get_radius=130_000, get_fill_color=[220, 38, 38, 230], pickable=True, auto_highlight=True))
-
-    view = pdk.View(type="_GlobeView", controller=True)
-    view_state = pdk.ViewState(latitude=35, longitude=20, zoom=0.35)
-    return pdk.Deck(
-        views=[view], layers=layers, initial_view_state=view_state,
-        map_provider=None, parameters={"cull": True},
-        tooltip={"text": "{tip}"},
+    figure = go.Figure()
+    if kept:
+        max_importance = max(c.kept_importance for c in kept)
+        figure.add_trace(go.Scattergeo(
+            lon=[c.lon for c in kept], lat=[c.lat for c in kept],
+            text=[f"{c.region} · {c.kept_count} kept · importance {c.kept_importance:.0f}"
+                  for c in kept],
+            customdata=[c.region for c in kept],
+            mode="markers", name="kept (credible)", hoverinfo="text",
+            marker=dict(
+                size=[14 + 34 * (c.kept_importance / max_importance) for c in kept],
+                color=GREEN, opacity=0.85, line=dict(width=1, color="white")),
+        ))
+    if rejected:
+        figure.add_trace(go.Scattergeo(
+            lon=[c.lon for c in rejected], lat=[c.lat for c in rejected],
+            text=[f"{c.region} · {c.rejected_count} spurious dropped" for c in rejected],
+            customdata=[c.region for c in rejected],
+            mode="markers", name="dropped (spurious)", hoverinfo="text",
+            marker=dict(size=12, color=RED, opacity=0.9, line=dict(width=1, color="white")),
+        ))
+    figure.update_geos(
+        projection_type="orthographic", showland=True, landcolor="#1f2937",
+        showocean=True, oceancolor="#0b1220", showcountries=True, countrycolor="#374151",
+        showcoastlines=False, bgcolor="rgba(0,0,0,0)",
+        projection_rotation=dict(lon=20, lat=30),
     )
+    figure.update_layout(
+        height=520, margin=dict(t=0, b=0, l=0, r=0), showlegend=True,
+        legend=dict(orientation="h", y=0), paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return figure
 
 
 def _clicked_region(event) -> str | None:
-    """Pull the region of a clicked globe object out of the pydeck selection event,
+    """Pull the region of a clicked globe marker out of the Plotly selection event,
     tolerating the slightly different shapes Streamlit returns across versions."""
     selection = getattr(event, "selection", None)
     if selection is None and isinstance(event, dict):
         selection = event.get("selection")
-    objects = (selection or {}).get("objects") if isinstance(selection, dict) else None
-    if isinstance(objects, dict):
-        for rows in objects.values():
-            if rows:
-                return rows[0].get("region")
+    points = (selection or {}).get("points") if isinstance(selection, dict) else None
+    if points:
+        custom = points[0].get("customdata")
+        if isinstance(custom, (list, tuple)):
+            return custom[0] if custom else None
+        return custom
     return None
 
 
@@ -489,6 +526,7 @@ def main() -> None:
                    "and the policy's own numbers. It explains the decision — it does not make it.")
     else:
         st.caption("Featherless unavailable — deterministic fallback narrative built from the same numbers.")
+    render_voiceover(explanation.text, "shock" if shock_active else "golden")
 
     st.subheader("Driver curation — what the agent trusted vs threw out")
     cur_left, cur_right = st.columns([3, 2])
@@ -507,7 +545,7 @@ def main() -> None:
         st.dataframe(rejected_table, use_container_width=True, hide_index=True, height=240)
 
     st.subheader("Where the drivers live — the agent's world view")
-    st.caption("Green columns are the suppliers and hubs the agent trusts (taller = more "
+    st.caption("Green markers are the suppliers and hubs the agent trusts (bigger = more "
                "kept importance); red markers are countries that only surfaced through "
                "spurious correlations. Drag to spin the globe and click a country — or pick "
                "one below — for a Featherless brief on why it does (or doesn't) move European gas." +
@@ -515,8 +553,8 @@ def main() -> None:
     countries = geo.aggregate_drivers(curation)
     globe_col, detail_col = st.columns([3, 2])
     with globe_col:
-        event = st.pydeck_chart(globe_deck(countries), use_container_width=True,
-                                on_select="rerun", selection_mode="single-object", key="globe")
+        event = st.plotly_chart(globe_figure(countries), use_container_width=True,
+                                on_select="rerun", key="globe")
         clicked = _clicked_region(event)
     with detail_col:
         names = [c.region for c in countries]
