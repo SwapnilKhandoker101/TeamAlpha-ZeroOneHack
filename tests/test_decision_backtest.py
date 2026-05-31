@@ -102,3 +102,63 @@ def test_empty_trajectories_give_an_empty_result():
     result = run_decision_backtest({"data": []}, ttf({"2025-01-01": 30.0}))
     assert result.n_months == 0
     assert "No backtest windows" in result.verdict
+
+
+# --------------------------------------------------------------------------- #
+# W12 — extra baselines (additive; the headline trio stays byte-identical)
+# --------------------------------------------------------------------------- #
+_TRAJ = {"data": [window("2025-03-01", {"2025-02-01": (40.0, 39.0, 41.0, 50.0)})]}
+_HIST = {"timeseries": {"2025-01-01": 30.0}}
+
+
+def test_always_full_cost_is_the_locked_forward():
+    row = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0})).rows[0]
+    # Lock 100% at the forward proxy (decision-time spot) → you pay exactly that, not the actual.
+    assert row.cost_always_full == pytest.approx(30.0)
+
+
+def test_random_ratio_baseline_is_seeded_and_in_unit_interval():
+    a = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), seed=7)
+    b = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), seed=7)
+    assert [r.random_ratio for r in a.rows] == [r.random_ratio for r in b.rows]  # reproduces
+    assert 0.0 <= a.rows[0].random_ratio <= 1.0
+    assert a.rows[0].cost_random_ratio == pytest.approx(
+        a.rows[0].random_ratio * 30.0 + (1 - a.rows[0].random_ratio) * 50.0)
+
+
+def test_extra_baselines_do_not_disturb_the_headline_trio():
+    # The policy / always-spot / always-half stats and the verdict are byte-identical
+    # whether or not the new baselines are computed (they are pure side outputs).
+    result = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}))
+    assert result.policy.mean_cost == pytest.approx(
+        result.rows[0].cost_policy)  # single row → mean is the row
+    assert result.always_full.name == "always lock 100%"
+    assert result.random_ratio.name == "random hedge ratio"
+    assert "Wider baseline set" in result.extended_verdict
+
+
+# --------------------------------------------------------------------------- #
+# W12 — shocked-scenario replay (depends on W6); calm replay stays byte-identical
+# --------------------------------------------------------------------------- #
+def test_shock_zero_is_byte_identical_to_the_calm_replay():
+    calm = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), shock_magnitude=0.0)
+    base = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}))
+    assert calm.rows == base.rows and calm.verdict == base.verdict
+    assert calm.is_shocked is False
+
+
+def test_shock_spikes_prices_and_lifts_the_hedge():
+    calm = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), shock_magnitude=0.0)
+    shocked = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), shock_magnitude=1.0)
+    assert shocked.is_shocked and shocked.shock_magnitude == pytest.approx(1.0)
+    # The realized price spikes, and the policy hedges at least as hard as in the calm case.
+    assert shocked.rows[0].actual > calm.rows[0].actual
+    assert shocked.rows[0].hedge_ratio >= calm.rows[0].hedge_ratio
+    assert "supply shock" in shocked.shock_verdict.lower()
+
+
+def test_shocked_policy_beats_buying_at_the_shocked_spot():
+    # With prices spiking, locking forward (the policy) is cheaper than buying everything
+    # at the shocked spot — the "adapts to a mid-run shift and still wins" story.
+    shocked = run_decision_backtest(_TRAJ, ttf({"2025-01-01": 30.0}), shock_magnitude=1.0)
+    assert shocked.policy.mean_cost < shocked.always_spot.mean_cost

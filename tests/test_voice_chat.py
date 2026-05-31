@@ -79,6 +79,46 @@ def test_fallback_surfaces_standing_premium(monkeypatch):
     assert "+7%" in answer.text
 
 
+def test_fallback_surfaces_the_ceramics_lock_when_supplied(monkeypatch):
+    # When the app puts the ceramics line on screen, the spoken fallback names that
+    # SECOND decision too — grounded in the figure the deterministic cost policy decided,
+    # never a re-computed one.
+    monkeypatch.setattr(llm, "featherless_available", lambda: False)
+    state = _state(0.53, ceramics_lock_ratio=0.40, ceramics_supplier="Alpine Clay Works")
+    answer = answer_question("what about ceramics?", state)
+    assert "53%" in answer.text  # the gas hedge stays
+    assert "40%" in answer.text and "ceramics" in answer.text.lower()
+    assert "Alpine Clay Works" in answer.text
+
+
+def test_fallback_omits_ceramics_when_absent(monkeypatch):
+    # Default (gas-only) state must stay byte-identical — no ceramics sentence leaks in.
+    monkeypatch.setattr(llm, "featherless_available", lambda: False)
+    assert "ceramics" not in answer_question("q", _state(0.53)).text.lower()
+
+
+def test_fallback_surfaces_the_shocked_ceramics_lock(monkeypatch):
+    monkeypatch.setattr(llm, "featherless_available", lambda: False)
+    state = _state(0.53, ceramics_lock_ratio=0.40, ceramics_scenario_lock=0.55)
+    answer = answer_question("what did the shock do to ceramics?", state)
+    assert "55%" in answer.text  # the shocked lock is surfaced for the second line
+
+
+def test_ceramics_brief_reaches_the_llm(monkeypatch):
+    captured: dict[str, str] = {}
+
+    def fake_chat_text(model, system, user, **kwargs):
+        captured["user"] = user
+        return "Spoken grounded answer."
+
+    monkeypatch.setattr(llm, "featherless_available", lambda: True)
+    monkeypatch.setattr(llm, "chat_text", fake_chat_text)
+    answer_question("why this ceramics lock?",
+                    _state(0.53, ceramics_lock_ratio=0.40, ceramics_supplier="Alpine Clay Works"))
+    assert "SECOND DECISION" in captured["user"]
+    assert "40%" in captured["user"] and "Alpine Clay Works" in captured["user"]
+
+
 def test_llm_path_receives_grounded_brief(monkeypatch):
     captured: dict[str, str] = {}
 
@@ -106,3 +146,44 @@ def test_llm_empty_output_falls_back(monkeypatch):
     answer = answer_question("q", _state(0.53))
     assert answer.source == "fallback"
     assert "53%" in answer.text
+
+
+# --------------------------------------------------------------------------- #
+# W11 — the app can explain ITSELF (about-intent), explanation-only
+# --------------------------------------------------------------------------- #
+def test_about_intent_detects_app_and_methodology_questions():
+    for q in ("What is this app?", "why was it built this way?",
+              "how does the hedge ratio work?", "what is Sybilion?", "what can you do?"):
+        assert voice_chat.is_about_question(q)
+    # A question about the CURRENT decision is NOT an about-question (stays grounded).
+    for q in ("why this hedge ratio?", "which supplier matters most?", "what changed?"):
+        assert not voice_chat.is_about_question(q)
+
+
+def test_about_fallback_describes_the_app_without_a_decision_number(monkeypatch):
+    monkeypatch.setattr(llm, "featherless_available", lambda: False)
+    answer = voice_chat.answer_about("what is this app?")
+    assert answer.source == "fallback"
+    # Describes the system + THE RULE…
+    assert "Sybilion" in answer.text
+    assert "never computes" in answer.text.lower() or "deterministic" in answer.text.lower()
+    # …and emits no hedge ratio / lock percentage (it's a description, not a decision).
+    assert "%" not in answer.text
+
+
+def test_about_uses_llm_grounded_on_the_overview(monkeypatch):
+    captured: dict[str, str] = {}
+
+    def fake_chat_text(model, system, user, **kwargs):
+        captured["system"] = system
+        captured["user"] = user
+        return "A grounded description of the app."
+
+    monkeypatch.setattr(llm, "featherless_available", lambda: True)
+    monkeypatch.setattr(llm, "chat_text", fake_chat_text)
+
+    answer = voice_chat.answer_about("why this design?")
+    assert answer.source == "llm" and answer.text == "A grounded description of the app."
+    # The model is handed the APP_OVERVIEW and told not to emit a decision number.
+    assert "TWO decisions" in captured["user"] or "two decisions" in captured["user"].lower()
+    assert "not a decision" in captured["system"].lower()

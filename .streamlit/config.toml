@@ -1,0 +1,25 @@
+# Professional theme for the Forecasting-AI dashboard (W8).
+#
+# A deliberate, cohesive dark palette — the same deep navy the Plotly globe/charts
+# already use for their ocean (#0b1220), so the page and its visualisations read as
+# one designed surface rather than default-Streamlit-on-white. The accent green
+# (#22c55e) is the "agent / decision" brand colour used throughout the charts.
+#
+# This is the *intentional palette* the build's polish rests on; the CSS layer in
+# app.py (_inject_global_css) builds typography, cards and the hero on top of it.
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"           # emerald — buttons, sliders, toggles, focus rings
+backgroundColor = "#0b1220"        # matches the globe/chart ocean — one cohesive surface
+secondaryBackgroundColor = "#111c33"  # cards, sidebar, inputs — a touch lighter than the page
+textColor = "#e5e7eb"              # soft off-white, easy on the eye against the navy
+font = "sans serif"
+
+[client]
+# Keep the toolbar minimal for a clean demo surface.
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[ui]
+hideTopBar = false

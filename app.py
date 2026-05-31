@@ -10,6 +10,7 @@ derives, and a Featherless narrative explaining the decision it did not make.
 from __future__ import annotations
 
 import hashlib
+import time
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -36,13 +37,24 @@ from gas_agent.scenario import (
     standing_risk_premium,
 )
 
-st.set_page_config(page_title="TTF Gas Hedging Agent", layout="wide")
+from ceramics_agent import forecast as cforecast
+from ceramics_agent import impact
+from ceramics_agent import intake
+from ceramics_agent import pipeline
+from ceramics_agent.cost_policy import CostWeights
+from ceramics_agent.scenario import affected_factors_for
+
+st.set_page_config(page_title="Forecasting AI — gas & ceramics decision agent", layout="wide")
 
 BLUE = "#2563eb"
 GREY = "#9ca3af"
 GREEN = "#16a34a"
 AMBER = "#d97706"
 RED = "#dc2626"
+
+# How many gas drivers the cross-decision overview (W4) shows before deferring to the
+# gas section's full kept-vs-rejected curation. Keeps the unified table scannable.
+GAS_DRIVER_LIMIT = 10
 
 
 @st.cache_data
@@ -78,9 +90,10 @@ def cached_explanation(job_id: str, persona: str, quarter_ratio: float):
 
 
 @st.cache_data
-def cached_backtest(job_id: str):
-    """Replay the hedge policy over the cached backtest windows vs naive baselines."""
-    return backtest_from_cache(job_id)
+def cached_backtest(job_id: str, shock_magnitude: float = 0.0):
+    """Replay the hedge policy over the cached backtest windows vs naive baselines.
+    ``shock_magnitude > 0`` runs the shocked-scenario replay (W12); 0 is the calm replay."""
+    return backtest_from_cache(job_id, shock_magnitude=shock_magnitude)
 
 
 @st.cache_data(show_spinner="Featherless is re-explaining under the shock…")
@@ -212,16 +225,24 @@ def hedge_ratio_figure(decisions) -> go.Figure:
     return figure
 
 
-def backtest_figure(result) -> go.Figure:
+def backtest_figure(result, extended: bool = False) -> go.Figure:
     """Realized cost per strategy; the whiskers are the cost volatility (std) — a
-    lower bar is cheaper, a shorter whisker is a steadier bill."""
+    lower bar is cheaper, a shorter whisker is a steadier bill. With ``extended`` the
+    two W12 baselines (always-lock-100% and a seeded random hedge ratio) are added,
+    so the chart shows the full 0/50/100% + coin-flip set around the policy."""
     names = ["Agent policy", "Always spot (0%)", "Always lock 50%"]
     means = [result.policy.mean_cost, result.always_spot.mean_cost, result.always_half.mean_cost]
     stds = [result.policy.std_cost, result.always_spot.std_cost, result.always_half.std_cost]
+    colors = [GREEN, GREY, AMBER]
+    if extended:
+        names += ["Always lock 100%", "Random ratio"]
+        means += [result.always_full.mean_cost, result.random_ratio.mean_cost]
+        stds += [result.always_full.std_cost, result.random_ratio.std_cost]
+        colors += [RED, BLUE]
 
     figure = go.Figure()
     figure.add_trace(go.Bar(
-        x=names, y=means, marker_color=[GREEN, GREY, AMBER],
+        x=names, y=means, marker_color=colors,
         error_y=dict(type="data", array=stds, visible=True, color="#374151", thickness=1.5),
         text=[f"€{m:.1f}" for m in means], textposition="outside",
         hovertemplate="%{x}<br>mean €%{y:.2f}/MWh<extra></extra>",
@@ -329,9 +350,49 @@ def _clicked_region(event) -> str | None:
 SHOCK_BUTTON_MESSAGE = "Iran closes the Strait of Hormuz"
 
 
-def _set_shock(magnitude: float, label: str) -> None:
+def _set_shock(magnitude: float, label: str, affected: tuple[str, ...] = ()) -> None:
+    """Set the one shared shock state both agents read. ``magnitude`` + ``label`` drive
+    the gas hedge; ``affected`` is the ceramics factor routing (which cost band(s) move),
+    so a single headline re-decides gas *and* ceramics together. Reset clears all three."""
     st.session_state.shock_magnitude = magnitude
     st.session_state.shock_label = label
+    st.session_state.shock_affected = tuple(affected)
+
+
+def _ceramics_shock_note(prompt: str, magnitude: float, label: str,
+                         affected: tuple[str, ...]) -> str:
+    """A one-paragraph chat note on what the same shock did to the ceramics line, so the
+    combined reply covers BOTH decisions. Computes the lock move deterministically from
+    the ceramics factors the section is showing (stashed in ``_cer_chat``); returns "" when
+    ceramics isn't on screen or the headline misses every ceramics factor. THE RULE holds —
+    the number is the cost policy's, not an LLM's."""
+    cer = st.session_state.get("_cer_chat")
+    if not cer:
+        return ""  # ceramics section not rendered this run — nothing to add
+    from ceramics_agent.cost_policy import CostWeights, decide_procurement, quarter_lock_ratio
+    from ceramics_agent.scenario import run_ceramics_shock
+
+    factors, _ = cforecast.load_ceramics_forecast(cer["job_id"])
+    weights = CostWeights(*cer["weights_tuple"])
+    calm = quarter_lock_ratio(decide_procurement(factors, weights))
+    outcome = run_ceramics_shock(factors, weights, magnitude, affected, label=label)
+    if not outcome.affected_factors:
+        return ""  # the headline hit no ceramics cost factor
+    names = ", ".join(outcome.affected_factors)
+    arrow = "up" if outcome.lock_ratio > calm else ("down" if outcome.lock_ratio < calm else "flat")
+    return (
+        f"On the **ceramics** line, the same headline hits **{names}** and re-runs the cost "
+        f"policy: the input-cost lock moves **{calm:.0%} → {outcome.lock_ratio:.0%}** ({arrow}, "
+        f"premium +{outcome.risk_premium:.0%}). The ceramics panel above has updated too."
+    )
+
+
+def _combined_shock_reply(prompt: str, months, spot, curation,
+                          magnitude: float, label: str, affected: tuple[str, ...]) -> str:
+    """One reply covering both agents: the gas hedge move, then the ceramics lock move."""
+    gas_part = _shock_reply(months, spot, curation, magnitude, label)
+    cer_part = _ceramics_shock_note(prompt, magnitude, label, affected)
+    return f"{gas_part}\n\n{cer_part}" if cer_part else gas_part
 
 
 def _shock_reply(months, spot, curation, magnitude: float, label: str) -> str:
@@ -387,6 +448,21 @@ def _chat_state(months, spot, curation) -> voice_chat.ChatState:
         decisions = decide_all(months, spot, DEFAULT_PARAMS, risk_premium=auto)
         used = curation
         applied_premium = auto
+    # Fold in the ceramics decision when its section is on screen (stashed in
+    # `_cer_chat`), so "what about ceramics?" answers from the SECOND decision too —
+    # all explanation-only, the numbers are the cost policy's. Absent → gas-only brief,
+    # byte-identical to before.
+    cer = st.session_state.get("_cer_chat")
+    ceramics_kwargs = {}
+    if cer:
+        ceramics_kwargs = dict(
+            ceramics_lock_ratio=cer["lock_ratio"],
+            ceramics_band_regime=cer["band_regime"],
+            ceramics_supplier=cer["supplier"],
+            ceramics_channel=cer["channel"],
+            ceramics_unit_margin=cer["unit_margin"],
+            ceramics_scenario_lock=cer["scenario_lock"],
+        )
     return voice_chat.ChatState(
         spot_price=spot,
         decisions=decisions,
@@ -396,6 +472,7 @@ def _chat_state(months, spot, curation) -> voice_chat.ChatState:
         standing_premium=applied_premium,
         scenario_label=label,
         scenario_magnitude=magnitude,
+        **ceramics_kwargs,
     )
 
 
@@ -407,9 +484,18 @@ def _route_chat_message(prompt: str, months, spot, curation, use_llm: bool,
     deterministic policy owns the ratio."""
     request = parse_shock_request(prompt, use_llm=use_llm)
     if request.is_shock:
-        _set_shock(request.magnitude, request.label)
-        reply = _shock_reply(months, spot, curation, request.magnitude, request.label)
+        # One headline, both agents: set the shared shock state (gas reads magnitude +
+        # label; ceramics reads the routed factors) and reply about both moves.
+        affected = affected_factors_for(prompt)
+        _set_shock(request.magnitude, request.label, affected)
+        reply = _combined_shock_reply(
+            prompt, months, spot, curation, request.magnitude, request.label, affected)
         return reply, ""  # the main body already narrates the shocked explanation
+    if voice_chat.is_about_question(prompt):
+        # "what is this app / why this design / how does the hedge ratio work" — the agent
+        # explains ITSELF from APP_OVERVIEW (explanation-only, never a decision number).
+        about = voice_chat.answer_about(prompt)
+        return about.text, about.text
     if freeform:
         return _freeform_reply(prompt), "I re-selected the Sybilion filters from your request."
     # Grounded question — answer from the current state without touching the shock.
@@ -428,154 +514,230 @@ def _handle_voice_prompt(text: str, months, spot, curation, use_llm: bool,
     st.rerun()
 
 
-def live_refresh_controls() -> None:
-    """Opt-in live Sybilion refresh — off by default.
-
-    OFF: the dashboard reads the pinned cached job (instant, offline, the same
-    numbers every run — the demo guarantee). ON + *Refresh now*: re-forecasts
-    against today's market into a **session-only** job; ``latest_job.txt`` stays
-    pinned, so toggling off restores the deterministic demo with no re-fetch.
-    """
-    have_key = config.have_sybilion_key()
-    st.toggle(
-        "Live Sybilion refresh",
-        value=False,
-        key="live_sybilion",
-        disabled=not have_key,
-        help=("OFF (default): the dashboard reads the cached forecast — instant, "
-              "offline, and the same numbers every run. ON: calls Sybilion live so "
-              "the forecast reflects today's market (needs SYBILION_API_KEY, takes "
-              "~10-60s, and the numbers will vary run to run)."),
+def _run_gas_live_forecast(persona: str) -> str:
+    """Submit a fresh TTF forecast to Sybilion for the given persona and return the
+    new job id. Used by the unified top-of-page live refresh; ``latest_job.txt``
+    stays pinned (``run_live_forecast`` never repoints it), so toggling back to
+    Cached restores the deterministic demo with no re-fetch."""
+    selection = select_filters(persona)
+    ttf = sc.load_ttf_series()
+    payload = sc.build_forecast_payload(
+        ttf["timeseries"],
+        title=ttf.get("meta", {}).get("title") or sc.DEFAULT_SERIES_TITLE,
+        keywords=selection.keywords,
+        category_ids=selection.category_ids,
+        region_codes=selection.region_codes,
     )
-    if not have_key:
-        st.caption("Set `SYBILION_API_KEY` to enable live refresh.")
+    return sc.run_live_forecast(sc.SybilionClient(), payload)
+
+
+def _resolve_gas_job() -> str | None:
+    """The gas forecast job in force: the session-only live job when the Live toggle is
+    on, else the pinned cached demo job (``None`` when nothing is cached). ``latest_job.txt``
+    is never repointed, so flipping Live off restores the deterministic demo with no fetch."""
+    live_on = st.session_state.get("live_mode_on", False)
+    live_job = st.session_state.get("live_gas_job")
+    return live_job if (live_on and live_job) else sc.get_latest_job()
+
+
+def _resolve_ceramics_job() -> str | None:
+    """The ceramics forecast job in force: a live ceramics job when Live is on, else
+    ``None`` → the committed mock (the offline demo source)."""
+    live_on = st.session_state.get("live_mode_on", False)
+    return st.session_state.get("live_cer_job") if live_on else None
+
+
+def _current_ceramics_weights(profile: intake.CompanyProfile) -> CostWeights:
+    """The ceramics cost weights for the drivers map: the user's live slider values once
+    the ceramics section has rendered them (persisted by widget key), else the weights the
+    company profile carries. Either way it is the *stated cost mix*, never a decision."""
+    version = st.session_state.get("profile_version", 0)
+    keys = (f"cer_w_gas_{version}", f"cer_w_clay_{version}",
+            f"cer_w_energy_{version}", f"cer_w_transport_{version}")
+    if all(key in st.session_state for key in keys):
+        return CostWeights(*(float(st.session_state[key]) for key in keys))
+    return profile.weights
+
+
+def _resolve_gas_inputs():
+    """Rebuild the gas grounding inputs (months / spot / curation) from the resolved
+    gas job — cached, so this is cheap to call from the bottom chat regardless of which
+    section is in focus. Returns ``None`` when no forecast is cached yet."""
+    job_id = _resolve_gas_job()
+    if not job_id:
+        return None
+    ttf, forecast_json, _metrics, signals = load_inputs(job_id)
+    months = sc.parse_forecast_months(forecast_json)
+    spot = sc.last_actual_price(ttf)
+    return months, spot, curate_drivers(signals)
+
+
+def render_drivers_panel(focus: str, profile: intake.CompanyProfile) -> None:
+    """W4 — one cross-decision map of *what moves what*, above the two decisions.
+
+    Gas's kept drivers and the ceramics per-factor drivers in one table: each driver, the
+    factor it explains, its Sybilion importance, **which decision it feeds**, and which way
+    that factor's forecast is heading over the horizon. Pure formatting over data the
+    pipeline already produced — curation dropped the spurious correlations upstream, and the
+    deterministic policies (not the LLM) turn this evidence into the hedge % and the lock %.
+    Honours the focus control, so it narrows to one agent when the page does."""
+    show_gas = focus in ("Both", "Gas only")
+    show_cer = focus in ("Both", "Ceramics only")
+
+    gas_rows: list[impact.ImpactRow] = []
+    if show_gas:
+        gas_job = _resolve_gas_job()
+        if gas_job:
+            _ttf, forecast_json, _metrics, signals = load_inputs(gas_job)
+            gas_rows = impact.gas_impact_rows(
+                curate_drivers(signals), sc.parse_forecast_months(forecast_json))
+
+    ceramics_rows: list[impact.ImpactRow] = []
+    if show_cer:
+        cer_job = _resolve_ceramics_job()
+        factors, _src = cforecast.load_ceramics_forecast(cer_job)
+        drivers_by_factor = cforecast.load_factor_drivers(cer_job)
+        ceramics_rows = impact.ceramics_impact_rows(
+            drivers_by_factor, factors, _current_ceramics_weights(profile))
+
+    rows = impact.combined_impact_rows(gas_rows, ceramics_rows, gas_limit=GAS_DRIVER_LIMIT)
+    if not rows:
         return
 
-    if st.session_state.get("live_sybilion"):
-        if st.button("Refresh now", use_container_width=True,
-                     help="Submit a fresh forecast to Sybilion and re-fetch its artifacts."):
-            try:
-                with st.spinner("Sybilion is forecasting against today's market… (~10-60s)"):
-                    selection = select_filters(DEFAULT_PERSONA)
-                    ttf = sc.load_ttf_series()
-                    payload = sc.build_forecast_payload(
-                        ttf["timeseries"],
-                        title=ttf.get("meta", {}).get("title") or sc.DEFAULT_SERIES_TITLE,
-                        keywords=selection.keywords,
-                        category_ids=selection.category_ids,
-                        region_codes=selection.region_codes,
-                    )
-                    new_job = sc.run_live_forecast(sc.SybilionClient(), payload)
-                st.session_state.live_job_id = new_job
-                st.session_state.live_job_fetched = pd.Timestamp.now().strftime("%H:%M:%S")
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001 — surface and keep the cached job
-                st.error(f"Live refresh failed: {exc}. Showing the cached forecast.")
-
-        live_job = st.session_state.get("live_job_id")
-        if live_job:
-            fetched = st.session_state.get("live_job_fetched", "")
-            st.success(
-                f"Live forecast active — job `{live_job[:8]}…`"
-                + (f", fetched {fetched}" if fetched else "")
-                + ". Cached demo restored when you toggle off."
-            )
-
-
-def scenario_sidebar(months, spot, curation) -> None:
-    """Live scenario controls + chat. Mutates ``st.session_state`` (shock magnitude
-    + label + message log); the main body reads that state and re-renders."""
-    with st.sidebar:
-        st.header("Live scenario")
-        st.caption("Type (or speak) a supply-shock headline and the agent re-decides on the "
-                   "spot — the LLM only reads the severity, the deterministic policy moves the "
-                   "ratio. Or just ask *why* — it explains the decision, never re-makes it.")
-
-        active = st.session_state.shock_magnitude > 0
-        button_cols = st.columns(2)
-        if button_cols[0].button("⚡ Strait of Hormuz", use_container_width=True,
-                                 help=f"Fires the canonical full-severity shock: '{SHOCK_BUTTON_MESSAGE}'."):
-            _set_shock(1.0, "Strait of Hormuz disruption")
-            st.session_state.messages.append({"role": "user", "content": SHOCK_BUTTON_MESSAGE})
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": _shock_reply(months, spot, curation, 1.0, "Strait of Hormuz disruption"),
-            })
-            st.rerun()
-        if button_cols[1].button("Reset to calm", use_container_width=True, disabled=not active):
-            _set_shock(0.0, "")
-            st.session_state.messages.append({"role": "assistant",
-                                              "content": "Back to the calm base case."})
-            st.rerun()
-
-        use_llm = st.toggle("Let Featherless classify the message",
-                            value=False, key="use_llm_classify",
-                            help="On: a small model reads severity + a label (never the ratio). "
-                                 "Off: deterministic keyword parse.")
-        freeform = st.toggle("Free-form re-forecast (re-pick Sybilion filters)",
-                             value=False, key="freeform_reforecast",
-                             help="On: a non-shock message re-runs the keyword agent to "
-                                  "re-pick the Sybilion filters (no live forecast call — see "
-                                  "Data source for that). Off (default): guided supply-shock only.")
-
-        st.divider()
-        st.subheader("Data source")
-        live_refresh_controls()
-
-        st.divider()
-        for message in st.session_state.messages:
-            st.chat_message(message["role"]).write(message["content"])
-
-        # Speak the most recent voice answer (queued on the prior run so the
-        # transcript renders first). Popped after playing so it never loops.
-        pending = st.session_state.pop("pending_voice", "")
-        if pending:
-            render_voiceover(pending, "chat", autoplay=True)
-
-        # Push-to-talk: record a question, transcribe it, then route it through the
-        # SAME branches a typed message hits. Hidden when no ASR backend is wired up,
-        # so the text chat and the no-keys demo are completely unchanged.
-        if transcribe.available():
-            audio = st.audio_input(
-                "🎤 Ask by voice",
-                key="voice_clip",
-                help="Record a question — 'why this hedge ratio?', 'which supplier "
-                     "matters most?'. It is transcribed, answered, and spoken back. "
-                     "Explanation only — it never changes the ratio.",
-            )
-            if audio is not None:
-                clip = audio.getvalue()
-                signature = hashlib.md5(clip).hexdigest() if clip else ""
-                if signature and signature != st.session_state.get("last_voice_sig"):
-                    st.session_state.last_voice_sig = signature
-                    with st.spinner("Transcribing…"):
-                        heard = transcribe.transcribe(clip)
-                    if heard:
-                        _handle_voice_prompt(heard, months, spot, curation, use_llm, freeform)
-                    else:
-                        st.warning("Couldn't transcribe that clip — try again or type your question.")
-        else:
-            st.caption("🎤 Voice input: add `HF_API_KEY` or `NVIDIA_ASR_FUNCTION_ID` to ask by voice.")
-
-        if prompt := st.chat_input("Ask 'why this ratio?' — or type a shock like 'Iran closes Hormuz'"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            reply, _ = _route_chat_message(prompt, months, spot, curation, use_llm, freeform)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-            st.rerun()
+    st.subheader("What moves what — the drivers behind both decisions")
+    st.caption(
+        "Each row is one external driver Sybilion surfaced: the factor it explains, its "
+        "importance, **which decision it feeds**, and which way that factor's forecast is "
+        "heading over the horizon. Curation has already dropped the spurious correlations; "
+        "the deterministic policies turn this evidence into the hedge % and the lock % — the "
+        "LLM never does.")
+    table = pd.DataFrame([{
+        "Driver": r.driver,
+        "Explains": r.explains,
+        "Importance": r.importance,
+        "Feeds decision": r.feeds,
+        "Direction": r.direction,
+    } for r in rows])
+    st.dataframe(
+        table, use_container_width=True, hide_index=True,
+        column_config={
+            "Importance": st.column_config.ProgressColumn(
+                "Importance", min_value=0, max_value=100, format="%.0f",
+                help="Sybilion's importance score for this driver (0–100)."),
+        },
+    )
+    notes: list[str] = []
+    if gas_rows:
+        notes.append(f"top {min(GAS_DRIVER_LIMIT, len(gas_rows))} of {len(gas_rows)} kept gas drivers")
+    if ceramics_rows:
+        notes.append(f"{len(ceramics_rows)} ceramics factor drivers (gas / clay / power / freight)")
+    if notes:
+        st.caption("Showing " + " · ".join(notes) +
+                   ". The gas section below carries the full kept-vs-rejected curation and the globe.")
 
 
-def render_gas_tab() -> None:
-    st.title("European gas (TTF) hedging agent")
+def render_chat_panel() -> None:
+    """The full-width chat at the page bottom — the demo's "talk to the agent" surface.
+
+    One message routes to BOTH agents: a supply-shock headline re-decides the gas hedge
+    *and* the ceramics lock at once (the reply reports both moves), while a "why" question
+    is answered from the current grounded state of either decision. The LLM only reads
+    severity / explains — every number stays the deterministic policy's. Mutates
+    ``st.session_state`` (shock + message log) then reruns; the panels above re-read it."""
+    resolved = _resolve_gas_inputs()
+    if resolved is None:
+        return  # no cached forecast yet — nothing to talk about
+    months, spot, curation = resolved
+
+    st.divider()
+    st.subheader("💬 Talk to the agent — push a shock, or ask why")
+    st.caption("Type (or speak) a supply-shock headline and **both** decisions re-run on the "
+               "spot — the LLM only reads the severity, the deterministic policies move the "
+               "numbers. Or just ask *why* — it explains either decision, never re-makes it — "
+               "or *what is this app?* and it explains itself.")
+
+    active = st.session_state.get("shock_magnitude", 0.0) > 0
+    controls = st.columns([1, 1, 2, 2])
+    if controls[0].button("⚡ Strait of Hormuz", use_container_width=True,
+                          help=f"Fires the canonical full-severity shock: '{SHOCK_BUTTON_MESSAGE}'."):
+        affected = affected_factors_for(SHOCK_BUTTON_MESSAGE)
+        _set_shock(1.0, "Strait of Hormuz disruption", affected)
+        st.session_state.messages.append({"role": "user", "content": SHOCK_BUTTON_MESSAGE})
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": _combined_shock_reply(
+                SHOCK_BUTTON_MESSAGE, months, spot, curation, 1.0,
+                "Strait of Hormuz disruption", affected),
+        })
+        st.rerun()
+    if controls[1].button("Reset to calm", use_container_width=True, disabled=not active):
+        _set_shock(0.0, "")
+        st.session_state.messages.append({"role": "assistant",
+                                          "content": "Back to the calm base case."})
+        st.rerun()
+    use_llm = controls[2].toggle(
+        "Let Featherless classify the message", value=False, key="use_llm_classify",
+        help="On: a small model reads severity + a label (never a number). "
+             "Off: deterministic keyword parse.")
+    freeform = controls[3].toggle(
+        "Free-form re-forecast (re-pick Sybilion filters)", value=False, key="freeform_reforecast",
+        help="On: a non-shock message re-runs the keyword agent to re-pick the Sybilion "
+             "filters (no live forecast call). Off (default): guided supply-shock only.")
+
+    log = st.container(height=320)
+    for message in st.session_state.messages:
+        log.chat_message(message["role"]).write(message["content"])
+
+    # Speak the most recent voice answer (queued on the prior run so the transcript
+    # renders first). Popped after playing so it never loops.
+    pending = st.session_state.pop("pending_voice", "")
+    if pending:
+        render_voiceover(pending, "chat", autoplay=True)
+
+    # Push-to-talk: record a question, transcribe it, then route it through the SAME
+    # branches a typed message hits. Hidden when no ASR backend is wired up, so the text
+    # chat and the no-keys demo are completely unchanged.
+    if transcribe.available():
+        audio = st.audio_input(
+            "🎤 Ask by voice", key="voice_clip",
+            help="Record a question — 'why this hedge ratio?', 'what about ceramics?'. "
+                 "It is transcribed, answered, and spoken back. Explanation only — it "
+                 "never changes a number.",
+        )
+        if audio is not None:
+            clip = audio.getvalue()
+            signature = hashlib.md5(clip).hexdigest() if clip else ""
+            if signature and signature != st.session_state.get("last_voice_sig"):
+                st.session_state.last_voice_sig = signature
+                with st.spinner("Transcribing…"):
+                    heard = transcribe.transcribe(clip)
+                if heard:
+                    _handle_voice_prompt(heard, months, spot, curation, use_llm, freeform)
+                else:
+                    st.warning("Couldn't transcribe that clip — try again or type your question.")
+    else:
+        st.caption("🎤 Voice input: add `HF_API_KEY` or `NVIDIA_ASR_FUNCTION_ID` to ask by voice.")
+
+    if prompt := st.chat_input("Ask 'why this ratio?' / 'what about ceramics?' / 'what is this "
+                               "app?' — or type a shock like 'Iran closes Hormuz'"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        reply, _ = _route_chat_message(prompt, months, spot, curation, use_llm, freeform)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.rerun()
+
+
+def render_gas_section(persona: str) -> None:
+    st.header("① Should we lock in gas forward?")
     st.caption("How much of next quarter's gas should an energy-intensive EU buyer "
                "lock in forward now, versus leave to spot? A decision built on the "
                "Sybilion forecast's confidence band — not its point estimate.")
 
-    # Job resolution: the pinned demo job by default. A live Sybilion refresh
-    # (sidebar toggle, off by default) swaps in a freshly-fetched, session-only
-    # job — latest_job.txt stays pinned, so toggling off instantly restores the
-    # deterministic demo numbers with no re-fetch.
-    live_on = st.session_state.get("live_sybilion", False)
-    live_job = st.session_state.get("live_job_id")
+    # Job resolution: the pinned demo job by default. The unified top-of-page
+    # Live⟷Cached toggle swaps in a freshly-fetched, session-only job — latest_job.txt
+    # stays pinned, so toggling back to Cached instantly restores the deterministic
+    # demo numbers with no re-fetch.
+    live_on = st.session_state.get("live_mode_on", False)
+    live_job = st.session_state.get("live_gas_job")
     job_id = live_job if (live_on and live_job) else sc.get_latest_job()
     if not job_id:
         st.error("No cached forecast found. Run a forecast first.")
@@ -592,13 +754,7 @@ def render_gas_tab() -> None:
     # mix shifts (e.g. after a live refresh).
     auto_premium = standing_risk_premium(base_curation)
     risk_share = risk_importance_share(base_curation)
-    selection = cached_selection(DEFAULT_PERSONA)
-
-    # Chat / scenario state. The sidebar mutates these; the body reads them.
-    st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("shock_magnitude", 0.0)
-    st.session_state.setdefault("shock_label", "")
-    scenario_sidebar(months, spot, base_curation)
+    selection = cached_selection(persona)
 
     # Resolve what to display: the calm base case, or — if a shock is active — the
     # same deterministic policy re-run over the shocked inputs.
@@ -677,7 +833,7 @@ def render_gas_tab() -> None:
     backtest = cached_backtest(job_id)
     bt_chart, bt_stats = st.columns([3, 2])
     with bt_chart:
-        st.plotly_chart(backtest_figure(backtest), use_container_width=True)
+        st.plotly_chart(backtest_figure(backtest, extended=True), use_container_width=True)
     with bt_stats:
         st.metric("Cheaper than buying spot", f"€{backtest.cost_saving_vs_spot:+.2f}/MWh",
                   help="Mean realized cost of the policy vs always buying on the spot market.")
@@ -686,17 +842,24 @@ def render_gas_tab() -> None:
         st.metric("vs a static 50% lock", f"€{backtest.cost_gap_vs_half:+.2f}/MWh",
                   help="Policy mean cost minus a mechanical 50% lock (negative = the policy is cheaper).")
     st.caption(backtest.verdict)
+    st.caption(backtest.extended_verdict)
     st.caption(f"Replayed over {backtest.n_months} backtested months. The lock price is proxied by the "
                "decision-time spot — Sybilion's weak point forecast is used only to *size* the hedge ratio, "
                "never as the price you pay. Hedging trades a little average cost for a steadier bill; here "
                "the policy beats do-nothing spot on both cost and volatility.")
 
+    # W12 × W6 — the shocked-scenario replay: does the decision logic still beat the
+    # baselines when a supply shock spikes prices mid-run? (Shown only under a live shock.)
+    if shock_active:
+        shocked_bt = cached_backtest(job_id, shock_magnitude=round(magnitude, 4))
+        st.info("🛡️ **Backtest under the active shock** — " + shocked_bt.shock_verdict)
+
     st.subheader("Why — the agent's explanation")
     if shock_active:
         explanation = cached_shock_explanation(
-            job_id, DEFAULT_PERSONA, round(magnitude, 4), st.session_state.shock_label)
+            job_id, persona, round(magnitude, 4), st.session_state.shock_label)
     else:
-        explanation = cached_explanation(job_id, DEFAULT_PERSONA, round(quarter_ratio, 4))
+        explanation = cached_explanation(job_id, persona, round(quarter_ratio, 4))
     st.info(explanation.text)
     if explanation.source == "llm":
         narrated = "the shocked drivers" if shock_active else "the curated drivers"
@@ -775,17 +938,310 @@ def render_gas_tab() -> None:
                "The hedge ratio is computed by deterministic code, not an LLM.")
 
 
+# --------------------------------------------------------------------------- #
+# Intake — one company description drives both agents (W1 + the single-page flow)
+# --------------------------------------------------------------------------- #
+_HERO_EXAMPLES: tuple[tuple[str, str], ...] = (
+    ("Handmade bowls (demo)",
+     "We are a Bavarian pottery making 5,000 handmade bowls over a two-week run. "
+     "Medium competition on our sales channel; gas firing is our biggest cost."),
+    ("Floor tiles, gas-intensive",
+     "Energy-intensive tile works producing 8,000 floor tiles in 3 weeks for export "
+     "to Germany and France. High competition, gas-intensive high-temperature firing."),
+    ("Dinnerware, electric kiln",
+     "We make 2,000 dinnerware sets over one month, low competition, and fire on an "
+     "electric kiln so our gas exposure is low."),
+)
+
+
+# Centralised CSS polish (W8). Built on the .streamlit/config.toml palette. Targets
+# stable Streamlit testids / structural classes only, and every rule is a gentle
+# enhancement (spacing, borders, weight) — never a layout-breaking override — so it
+# degrades safely across Streamlit versions and never blocks the demo.
+_GLOBAL_CSS = """
+<style>
+  /* Breathing room + a comfortable reading width for the stacked single page. */
+  div.block-container { padding-top: 2.2rem; padding-bottom: 4rem; max-width: 1280px; }
+
+  /* Hero. */
+  .fa-hero h1 { font-size: 2.5rem; font-weight: 800; letter-spacing: -0.02em; margin: 0; line-height: 1.1; }
+  .fa-hero .fa-accent {
+    background: linear-gradient(90deg, #22c55e 0%, #38bdf8 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .fa-hero p { color: #9aa7bd; font-size: 1.08rem; margin-top: .5rem; max-width: 62rem; line-height: 1.55; }
+  .fa-pill {
+    display: inline-block; margin-top: .9rem; padding: .28rem .7rem; border-radius: 999px;
+    font-size: .8rem; font-weight: 600; color: #bbf7d0;
+    background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.35);
+  }
+
+  /* Section headers (the ① / ② decision headers) get an accent rule. */
+  [data-testid="stHeading"] h2 {
+    border-left: 4px solid #22c55e; padding-left: .6rem; margin-top: .4rem;
+    font-weight: 750; letter-spacing: -0.01em;
+  }
+
+  /* Metrics as cards. */
+  [data-testid="stMetric"] {
+    background: #111c33; border: 1px solid #1f2c47; border-radius: 12px;
+    padding: 14px 16px;
+  }
+  [data-testid="stMetricValue"] { font-weight: 750; }
+
+  /* Bordered containers (input panels, callouts) — softer, rounded. */
+  [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px; }
+
+  /* Buttons + chat input: rounded, confident. */
+  .stButton > button { border-radius: 10px; font-weight: 600; }
+  [data-testid="stChatInput"] textarea { border-radius: 10px; }
+
+  /* Tab-like radio (globe layer toggle) + segmented control read as pills. */
+  [data-testid="stCaptionContainer"] { color: #8a98ad; }
+</style>
+"""
+
+
+def _inject_global_css() -> None:
+    """Apply the global CSS polish once per run (idempotent — Streamlit dedups <style>)."""
+    st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
+
+
+def render_hero() -> None:
+    st.markdown(
+        "<div class='fa-hero'>"
+        "<h1>Forecasting <span class='fa-accent'>AI</span> — supply &amp; hedging decisions</h1>"
+        "<p>Describe your manufacturing business once. The agent forecasts your costs with "
+        "Sybilion's probabilistic bands and decides two things — <b>how much gas to lock "
+        "forward</b> and <b>how to run your ceramics line</b> — every number computed "
+        "deterministically, the LLM only explaining.</p>"
+        "<span class='fa-pill'>● Deterministic decisions · the LLM only explains</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _profile_signature(profile: intake.CompanyProfile) -> str:
+    """A stable string identifying a profile, for the live-forecast cache key."""
+    return "|".join([
+        profile.product_id, str(profile.quantity), str(profile.timeline_days),
+        profile.competition, profile.gas_exposure, ",".join(profile.sell_regions),
+    ])
+
+
+def _render_hero_form() -> None:
+    """The opening intake: example chips + a free-text description box. On submit it
+    extracts a CompanyProfile (LLM extraction-only → deterministic fallback) and
+    queues the pipeline animation."""
+    st.session_state.setdefault("intake_text", "")
+    st.caption("Try an example, or describe your own business:")
+    ex_cols = st.columns(len(_HERO_EXAMPLES))
+    for col, (label, text) in zip(ex_cols, _HERO_EXAMPLES):
+        if col.button(label, use_container_width=True):
+            st.session_state["intake_text"] = text
+            st.rerun()
+
+    with st.form("intake_form"):
+        st.text_area(
+            "Describe your company",
+            key="intake_text",
+            height=140,
+            placeholder="e.g. We make 5,000 handmade bowls over two weeks; gas firing is our "
+                        "biggest cost and competition is medium.",
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button(
+            "⚡ Forecast my business", type="primary", use_container_width=True)
+
+    st.caption("Leave it blank and submit to run the committed demo base case "
+               "(5,000 handmade bowls). No keys needed.")
+
+    if submitted:
+        text = st.session_state.get("intake_text", "").strip()
+        profile, missing = intake.parse_description(text)
+        st.session_state["profile"] = profile
+        st.session_state["missing"] = missing
+        st.session_state["profile_version"] = st.session_state.get("profile_version", 0) + 1
+        st.session_state["run_pipeline"] = True
+        # Only pause for clarifiers when the user wrote something we couldn't fully parse;
+        # a blank submit means "just run the demo defaults", so skip straight to results.
+        questions = intake.follow_up_questions(missing) if text else []
+        st.session_state["awaiting_followups"] = bool(questions)
+        st.rerun()
+
+
+def _render_followups() -> None:
+    """Ask 1-3 plain clarifiers for the fields the description didn't state. Skippable —
+    the profile is already complete with committed defaults, so this only refines it."""
+    profile: intake.CompanyProfile = st.session_state["profile"]
+    questions = intake.follow_up_questions(st.session_state.get("missing", []))
+    st.info("A few quick clarifiers so the forecast fits your business — or skip and I'll "
+            "use sensible defaults.")
+    with st.form("followups_form"):
+        typed: dict[str, str] = {}
+        for question in questions:
+            field_name = intake.missing_field_for_question(question)
+            if field_name:
+                typed[field_name] = st.text_input(question, key=f"fu_{field_name}")
+        cols = st.columns(2)
+        cont = cols[0].form_submit_button("Continue", type="primary", use_container_width=True)
+        skip = cols[1].form_submit_button("Skip — use defaults", use_container_width=True)
+    if cont or skip:
+        if cont:
+            for field_name, answer in typed.items():
+                if answer and answer.strip():
+                    profile = intake.apply_answer(profile, field_name, answer)
+            st.session_state["profile"] = profile
+        st.session_state["awaiting_followups"] = False
+        st.rerun()
+
+
+def resolve_intake() -> intake.CompanyProfile | None:
+    """Return the resolved CompanyProfile, or None while still gathering input
+    (so :func:`main` renders only the intake screen until we have a profile)."""
+    if "profile" not in st.session_state:
+        _render_hero_form()
+        return None
+    if st.session_state.get("awaiting_followups"):
+        _render_followups()
+        return None
+    return st.session_state["profile"]
+
+
+def _render_profile_summary(profile: intake.CompanyProfile) -> None:
+    """The compact "your business" banner shown above the decisions, with a reset."""
+    with st.container(border=True):
+        cols = st.columns([5, 1])
+        regions = f" · sells into {', '.join(profile.sell_regions)}" if profile.sell_regions else ""
+        cols[0].markdown(
+            f"**Your business** — {profile.quantity:,} × {profile.product_name} · "
+            f"{profile.timeline_days}-day run · {profile.competition} channel competition · "
+            f"gas exposure {profile.gas_exposure}{regions}")
+        if cols[1].button("↻ Start over", use_container_width=True):
+            for key in ("profile", "missing", "awaiting_followups", "run_pipeline",
+                        "live_gas_job", "live_cer_job", "shock_magnitude", "shock_label",
+                        "messages"):
+                st.session_state.pop(key, None)
+            st.rerun()
+        source_note = {"llm": "Featherless extracted these facts from your description",
+                       "fallback": "Extracted by deterministic keyword scan (no LLM key)",
+                       "default": "Demo base case (no description given)"}.get(profile.source, "")
+        st.caption(f"{source_note}. This one description drives both decisions below — the LLM "
+                   "only extracts stated facts, it never invents an input or a number.")
+
+
+def _render_live_refresh(profile: intake.CompanyProfile) -> None:
+    """The unified live refresh: one button forecasts BOTH the gas band and the four
+    ceramics factor bands live, caching each (latest_job.txt is never repointed, so
+    flipping back to Cached restores the deterministic demo)."""
+    gas_job = st.session_state.get("live_gas_job")
+    cer_job = st.session_state.get("live_cer_job")
+    if st.button("🔄 Run live forecast now", use_container_width=True,
+                 help="Submit fresh forecasts to Sybilion (gas + 4 ceramics factors) for "
+                      "today's market. ~1-4 min; cached for the session."):
+        try:
+            with st.status("Forecasting live against today's market…", expanded=True) as status:
+                st.write("Submitting the gas (TTF) band to Sybilion…")
+                st.session_state["live_gas_job"] = _run_gas_live_forecast(profile.persona())
+                st.write("Submitting the four ceramics factor bands (gas / clay / power / freight)…")
+                st.session_state["live_cer_job"] = cforecast.ensure_ceramics_forecast(
+                    sc.SybilionClient(), cforecast.default_factor_history(),
+                    signature=_profile_signature(profile))
+                status.update(label="Live forecast cached — the numbers below are live.",
+                              state="complete", expanded=False)
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001 — surface and keep the cached demo
+            st.error(f"Live refresh failed: {exc}. Showing the cached forecast.")
+    if gas_job or cer_job:
+        st.success(
+            f"Live forecast active — gas `{(gas_job or '—')[:10]}…`, "
+            f"ceramics `{cer_job or '—'}`. Toggle off to restore the cached demo.")
+
+
+def render_top_controls(profile: intake.CompanyProfile) -> str:
+    """The single Live⟷Cached toggle + the gas/ceramics focus control. Returns the
+    focus selection ("Both" / "Gas only" / "Ceramics only")."""
+    have_key = config.have_sybilion_key()
+    left, right = st.columns([3, 2])
+    with left:
+        live = st.toggle(
+            "Live Sybilion forecast", value=st.session_state.get("live_mode_on", False),
+            key="live_mode_on", disabled=not have_key,
+            help="OFF (default): committed cached / mock forecasts — instant, offline, identical "
+                 "every run (the reproducible demo). ON: forecast live against today's market.")
+        if not have_key:
+            st.caption("🔒 Cached demo — set `SYBILION_API_KEY` to forecast live.")
+        elif live:
+            _render_live_refresh(profile)
+    with right:
+        focus = st.segmented_control(
+            "Show", ["Both", "Gas only", "Ceramics only"], default="Both", key="focus")
+    return focus or "Both"
+
+
+def _play_pipeline_animation(profile: intake.CompanyProfile) -> None:
+    """A one-shot staged progress animation while the forecast resolves, with short
+    LLM-written (template-fallback) status blurbs. THE RULE holds — the blurbs only
+    narrate the activity, never a number or a decision."""
+    blurbs = pipeline.generate_blurbs(profile.persona())
+    stages = pipeline.PIPELINE_STAGES
+    with st.status("Forecasting your business…", expanded=True) as status:
+        bar = st.progress(0.0)
+        for index, stage in enumerate(stages, start=1):
+            st.write(f"**{stage.label}** — {blurbs[stage.key]}")
+            bar.progress(index / len(stages))
+            time.sleep(0.3)
+        status.update(label="✅ Forecast ready — both decisions below.",
+                      state="complete", expanded=False)
+
+
 def main() -> None:
-    """Two decision agents, one app. The gas tab is the original dashboard,
-    unchanged; the ceramics tab is the second agent. The sidebar (gas shock
-    scenario + voice) stays global — it is rendered inside the gas tab body."""
-    tab_gas, tab_cer = st.tabs(["Gas hedging", "Ceramics optimizer"])
-    with tab_gas:
-        render_gas_tab()
-    with tab_cer:
+    """One page, two decision agents, one company description.
+
+    The user describes their business once; that description is the shared persona
+    for the gas forecast and the four ceramics factors, and it fills the ceramics
+    decision inputs. Both decisions render stacked below a single Live⟷Cached
+    control, with one full-width chat at the bottom: a supply-shock headline there
+    re-decides BOTH agents at once, and a "why" question explains either. Every
+    number stays deterministic — the LLM only narrates."""
+    _inject_global_css()
+    render_hero()
+    profile = resolve_intake()
+    if profile is None:
+        return  # still gathering the description / clarifiers
+
+    # Shared shock + chat state (the bottom chat mutates these; both sections read them).
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("shock_magnitude", 0.0)
+    st.session_state.setdefault("shock_label", "")
+    st.session_state.setdefault("shock_affected", ())
+    # The ceramics chat context is repopulated each run by the ceramics section when it
+    # renders; clear it first so the bottom chat only carries ceramics grounding when the
+    # ceramics decision is actually on screen this run.
+    st.session_state.pop("_cer_chat", None)
+
+    _render_profile_summary(profile)
+    focus = render_top_controls(profile)
+
+    if st.session_state.pop("run_pipeline", False):
+        _play_pipeline_animation(profile)
+
+    # The cross-decision driver map (W4) — what moves what, above both decisions.
+    render_drivers_panel(focus, profile)
+
+    if focus in ("Both", "Gas only"):
+        render_gas_section(profile.persona())
+    if focus == "Both":
+        st.divider()
+    if focus in ("Both", "Ceramics only"):
         from ceramics_agent.dashboard import render_ceramics_tab
 
-        render_ceramics_tab(render_voiceover)
+        live_on = st.session_state.get("live_mode_on", False)
+        cer_job = st.session_state.get("live_cer_job") if live_on else None
+        render_ceramics_tab(render_voiceover, profile=profile, job_id=cer_job)
+
+    # One shared chat for both decisions, full-width at the page bottom.
+    render_chat_panel()
 
 
 if __name__ == "__main__":

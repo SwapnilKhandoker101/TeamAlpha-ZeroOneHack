@@ -16,6 +16,7 @@ lets the determinism test exercise the whole pipeline without touching a model
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from gas_agent.hedge_policy import MonthDecision, MonthForecast
@@ -43,6 +44,7 @@ from ceramics_agent.curation import (
 )
 from ceramics_agent.forecast import load_ceramics_forecast
 from ceramics_agent.negotiation import NegotiationResult, negotiate
+from ceramics_agent.scenario import run_ceramics_shock
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,26 @@ class Recommendation:
     # --- negotiation + backtest (C5, C6) ---
     negotiation: NegotiationResult
     backtest: CeramicsBacktestResult
+
+    # --- optional supply-shock overlay (W6/W7 — additive; defaults = calm path) ---
+    # When a chat headline shocks the ceramics line, these record what moved so the
+    # dashboard can draw a scenario banner and the calm→shocked lock delta. All
+    # defaults leave the calm recommendation byte-identical to before.
+    calm_lock_ratio: float = 0.0  # the pre-shock lock (the delta's baseline)
+    shock_magnitude: float = 0.0
+    shock_label: str = ""
+    shock_affected: tuple[str, ...] = ()
+    scenario_premium: float = 0.0  # the shock's OWN marginal floor (for the readout)
+
+    @property
+    def shock_active(self) -> bool:
+        """True when a supply shock re-decided this recommendation."""
+        return self.shock_magnitude > 0.0 and bool(self.shock_affected)
+
+    @property
+    def lock_delta(self) -> float:
+        """How much the shock lifted the lock vs the calm baseline (0.0 when calm)."""
+        return self.lock_ratio - self.calm_lock_ratio
 
     @property
     def band_regime(self) -> str:
@@ -117,25 +139,50 @@ def build_recommendation(
     *,
     target_month: str | None = None,
     job_id: str | None = None,
+    shock_magnitude: float = 0.0,
+    shock_affected: Iterable[str] = (),
+    shock_label: str = "",
+    base_risk_premium: float = 0.0,
 ) -> Recommendation:
     """Run the full deterministic pipeline and assemble the recommendation.
 
     ``target_month`` defaults to the nearest forecast month (the next production
     run). Everything is pure arithmetic on the committed catalog + forecast; the
-    only optional, off-path I/O is a live forecast behind ``job_id`` (else mock)."""
+    only optional, off-path I/O is a live forecast behind ``job_id`` (else mock).
+
+    A chat-driven supply shock is applied via the optional ``shock_*`` params
+    (default = no shock → byte-identical calm recommendation). When active, the
+    affected factor band(s) are re-cast by :func:`ceramics_agent.scenario.run_ceramics_shock`
+    and the **shocked** bands drive the cost chart, the supplier routing (a higher
+    lock favours the top-ranked supplier), the negotiation and the backtest — so one
+    headline moves the whole ceramics decision, mirroring the gas hedge. THE RULE
+    still holds: every number here is deterministic arithmetic, never an LLM output."""
     factors, source = load_ceramics_forecast(job_id)
     product = get_product(product_id)
     months = _forecast_months(factors)
     target = target_month if target_month in months else (months[0] if months else "")
 
-    # --- C3: the lock-% decision + the physical cost band ---
-    decisions = decide_procurement(factors, weights)
-    lock_ratio = quarter_lock_ratio(decisions)
-    band_width = quarter_band_width(decisions)
-    cost_band = physical_cost_band(product, factors)
-    unit_cost = unit_cost_estimate(product, factors)
+    # --- the calm baseline (always computed — the pre-shock reference for the delta) ---
+    calm_decisions = decide_procurement(factors, weights)
+    calm_lock_ratio = quarter_lock_ratio(calm_decisions)
 
-    # --- C4: curate + choose, routed by the lock stance ---
+    # --- C3: the lock-% decision + the physical cost band (shocked when a shock is live) ---
+    outcome = (
+        run_ceramics_shock(
+            factors, weights, shock_magnitude, shock_affected,
+            label=shock_label, base_risk_premium=base_risk_premium,
+        )
+        if shock_magnitude > 0.0 else None
+    )
+    shock_on = outcome is not None and bool(outcome.affected_factors)
+    eff_factors = outcome.factors if shock_on else factors
+    decisions = outcome.decisions if shock_on else calm_decisions
+    lock_ratio = outcome.lock_ratio if shock_on else calm_lock_ratio
+    band_width = outcome.band_width if shock_on else quarter_band_width(calm_decisions)
+    cost_band = physical_cost_band(product, eff_factors)
+    unit_cost = unit_cost_estimate(product, eff_factors)
+
+    # --- C4: curate + choose, routed by the (possibly shocked) lock stance ---
     supplier_curation = curate_suppliers(timeline_days)
     channel_curation = curate_channels(target, quantity)
     chosen_supplier = select_supplier(supplier_curation.kept, lock_ratio)
@@ -155,11 +202,11 @@ def build_recommendation(
     if supplier_obj is None or channel_obj is None:
         raise ValueError("No credible supplier or channel survived curation — cannot negotiate.")
     negotiation = negotiate(
-        product, supplier_obj, channel_obj, factors, target, quantity, timeline_days, competition
+        product, supplier_obj, channel_obj, eff_factors, target, quantity, timeline_days, competition
     )
 
-    # --- C6: replay the three strategies for the same lock stance ---
-    backtest = run_ceramics_backtest(factors, lock_ratio)
+    # --- C6: replay the three strategies for the same (possibly shocked) lock stance ---
+    backtest = run_ceramics_backtest(eff_factors, lock_ratio)
 
     return Recommendation(
         product=product,
@@ -180,4 +227,9 @@ def build_recommendation(
         chosen_channel=chosen_channel,
         negotiation=negotiation,
         backtest=backtest,
+        calm_lock_ratio=calm_lock_ratio,
+        shock_magnitude=outcome.magnitude if shock_on else 0.0,
+        shock_label=outcome.label if shock_on else "",
+        shock_affected=outcome.affected_factors if shock_on else (),
+        scenario_premium=outcome.risk_premium if shock_on else 0.0,
     )

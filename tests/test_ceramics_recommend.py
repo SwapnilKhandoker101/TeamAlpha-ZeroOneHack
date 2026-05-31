@@ -76,3 +76,59 @@ def test_recommendation_labels_are_well_formed():
     rec = build_recommendation("bowl", 2000, 10, default_weights(), "low")
     assert rec.band_regime in {"tight", "moderate", "wide"}
     assert "lock" in rec.lock_label.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Supply-shock overlay (W6/W7) — additive; defaults leave the calm path identical
+# --------------------------------------------------------------------------- #
+def test_no_shock_params_are_byte_identical_to_the_calm_path():
+    calm = build_recommendation("tile", 5000, 14, default_weights(), "medium")
+    # Passing the shock params at their no-op defaults must not move any number.
+    explicit = build_recommendation(
+        "tile", 5000, 14, default_weights(), "medium",
+        shock_magnitude=0.0, shock_affected=(), shock_label="",
+    )
+    assert _core(calm) == _core(explicit)
+    assert not calm.shock_active
+    assert calm.lock_delta == 0.0
+    assert calm.calm_lock_ratio == calm.lock_ratio
+
+
+def test_a_gas_shock_raises_the_lock_and_records_the_scenario():
+    calm = build_recommendation("tile", 5000, 14, default_weights(), "medium")
+    shocked = build_recommendation(
+        "tile", 5000, 14, default_weights(), "medium",
+        shock_magnitude=1.0, shock_affected=("gas",), shock_label="Strait of Hormuz disruption",
+    )
+    assert shocked.shock_active
+    assert shocked.shock_affected == ("gas",)
+    assert shocked.shock_label == "Strait of Hormuz disruption"
+    assert shocked.lock_ratio > calm.lock_ratio
+    # The calm baseline is preserved for the delta, and the delta is the gap.
+    assert shocked.calm_lock_ratio == calm.lock_ratio
+    assert shocked.lock_delta > 0.0
+    assert shocked.scenario_premium > 0.0
+
+
+def test_shocked_recommendation_is_deterministic():
+    a = build_recommendation(
+        "tile", 5000, 14, default_weights(), "medium",
+        shock_magnitude=0.6, shock_affected=("gas", "shipping"),
+    )
+    b = build_recommendation(
+        "tile", 5000, 14, default_weights(), "medium",
+        shock_magnitude=0.6, shock_affected=("gas", "shipping"),
+    )
+    assert _core(a) == _core(b)
+    assert a.lock_delta == b.lock_delta
+
+
+def test_empty_affected_set_leaves_the_calm_decision():
+    calm = build_recommendation("tile", 5000, 14, default_weights(), "medium")
+    # A magnitude with no factor to hit is a no-op — the calm numbers stand.
+    noop = build_recommendation(
+        "tile", 5000, 14, default_weights(), "medium",
+        shock_magnitude=1.0, shock_affected=(),
+    )
+    assert _core(noop) == _core(calm)
+    assert not noop.shock_active

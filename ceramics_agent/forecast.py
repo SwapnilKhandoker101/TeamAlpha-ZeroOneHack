@@ -29,6 +29,7 @@ live refresh) **never repoints ``latest_job.txt``**.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 
@@ -196,10 +197,51 @@ FACTOR_REQUEST_META: dict[str, dict] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Cache-first plumbing — a deterministic combined-job id so re-submitting the same
+# profile reuses the cached live artifact instead of re-polling 4 jobs (~1-4 min).
+# --------------------------------------------------------------------------- #
+def combined_job_id(signature: str) -> str:
+    """A stable combined-job id derived from a signature (the company description +
+    the chosen Sybilion filters). Same signature → same job dir → cache hit, so a
+    live forecast is polled once per distinct profile and instant on every reload."""
+    salt = getattr(config, "CERAMICS_CACHE_SALT", "ceramics-v1")
+    digest = hashlib.sha1(f"{salt}|{signature}".encode("utf-8")).hexdigest()[:12]
+    return f"ceramics-{digest}"
+
+
+def live_artifact_exists(job_id: str | None) -> bool:
+    """True when a combined live artifact is already cached for ``job_id``."""
+    if not job_id:
+        return False
+    return sc.artifact_path(job_id, "ceramics_forecast").exists()
+
+
+def ensure_ceramics_forecast(
+    client: sc.SybilionClient,
+    base_series_by_factor: dict[str, dict],
+    *,
+    signature: str,
+    refresh: bool = False,
+    soft_horizon: int = 6,
+) -> str:
+    """Cache-first live forecast. Returns the cached combined job for this signature
+    when present (instant, deterministic for the session), otherwise runs the four
+    live jobs and caches them under the signature's deterministic id. ``refresh=True``
+    forces a re-poll (e.g. a chat impact invalidated a factor)."""
+    job_id = combined_job_id(signature)
+    if not refresh and live_artifact_exists(job_id):
+        return job_id
+    return run_live_ceramics_forecast(
+        client, base_series_by_factor, job_id=job_id, soft_horizon=soft_horizon
+    )
+
+
 def run_live_ceramics_forecast(
     client: sc.SybilionClient,
     base_series_by_factor: dict[str, dict],
     *,
+    job_id: str | None = None,
     soft_horizon: int = 6,
 ) -> str:
     """Forecast all four factors live and cache one combined ``ceramics_forecast.json``.
@@ -209,9 +251,10 @@ def run_live_ceramics_forecast(
     historical ``{month: price}`` series in ``base_series_by_factor`` and runs the
     same submit→poll→cache loop (:func:`~gas_agent.sybilion_client.run_live_forecast`).
     The four per-factor forecasts are then assembled into a single artifact under a
-    **fresh** combined job dir.
+    combined job dir (``job_id`` when given — the cache-first deterministic id —
+    else a fresh random one).
 
-    Non-destructive by design (mirrors the gas live refresh): it caches under a new
+    Non-destructive by design (mirrors the gas live refresh): it caches under
     ``cache/<combined_job>/`` and **never** calls ``set_latest_job``, so toggling
     live off instantly restores the committed mock. Returns the combined job id.
     """
@@ -236,7 +279,7 @@ def run_live_ceramics_forecast(
         factors_block[factor] = {"forecast_series": forecast_json["data"]["forecast_series"]}
         drivers_block[factor] = _live_drivers_for(factor, factor_job)
 
-    combined_job = f"ceramics-{uuid.uuid4().hex[:8]}"
+    combined_job = job_id or f"ceramics-{uuid.uuid4().hex[:8]}"
     artifact = {
         "meta": {"source": "live", "factors": list(factors_block), "units": FACTOR_UNITS},
         "factors": factors_block,

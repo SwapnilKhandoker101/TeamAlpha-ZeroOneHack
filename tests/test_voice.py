@@ -154,6 +154,33 @@ def test_local_only_never_touches_nvidia(monkeypatch):
     assert clip is not None and clip.provider == "local"
 
 
+def test_providers_override_forces_local_even_with_nvidia(monkeypatch):
+    # The pipeline filler passes providers=["local"] so it never burns the NVIDIA
+    # free-tier window on throwaway chatter — even with a key and room under the limit.
+    monkeypatch.setattr(config, "VOICE_PROVIDER", "auto")
+    monkeypatch.setattr(config, "have_nvidia_key", lambda: True)
+    monkeypatch.setattr(voice, "_local_available", lambda: True)
+    monkeypatch.setattr(voice, "_synthesize_nvidia",
+                        lambda text: pytest.fail("providers=['local'] must skip NVIDIA"))
+    monkeypatch.setattr(voice, "_synthesize_local", lambda text: _clip("local"))
+
+    clip = voice.synthesize("filler", providers=["local"])
+    assert clip is not None and clip.provider == "local"
+    assert voice.nvidia_calls_in_window() == 0  # NVIDIA window untouched
+
+
+def test_providers_none_keeps_configured_order(monkeypatch):
+    # Default providers=None must reproduce today's behaviour (configured order).
+    monkeypatch.setattr(config, "VOICE_PROVIDER", "auto")
+    monkeypatch.setattr(config, "have_nvidia_key", lambda: True)
+    monkeypatch.setattr(voice, "_local_available", lambda: True)
+    monkeypatch.setattr(voice, "_synthesize_nvidia", lambda text: _clip("nvidia"))
+    monkeypatch.setattr(voice, "_synthesize_local",
+                        lambda text: pytest.fail("default order should prefer NVIDIA"))
+    clip = voice.synthesize("hello")
+    assert clip is not None and clip.provider == "nvidia"
+
+
 # --------------------------------------------------------------------------- #
 # PCM → WAV helper (NVIDIA returns raw LINEAR_PCM)
 # --------------------------------------------------------------------------- #

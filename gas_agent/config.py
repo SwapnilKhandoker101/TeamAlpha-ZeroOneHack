@@ -105,9 +105,24 @@ CERAMICS_DEFAULT_WEIGHTS: dict[str, float] = {
 # reproduces run to run — determinism is the selling point, even for the foil.
 CERAMICS_BACKTEST_SEED = 7
 
+# Seed for the gas backtest's random-hedge-ratio baseline (the "beats a coin flip"
+# foil for the hedge ratio). Seeded for the same reproducibility reason as above.
+GAS_BACKTEST_SEED = 7
+
 # Committed mock 4-factor forecast — the ceramics demo's source of truth, the
 # analogue of the cached gas job. Regenerate with scripts/build_ceramics_forecast.py.
 CERAMICS_MOCK_FORECAST = CACHE_DIR / "mock_ceramics_forecast.json"
+
+# Cache-key salt for the opt-in live 4-factor forecast. The combined job id is a
+# hash of (this salt | the company description + chosen filters), so re-submitting
+# the same profile reuses the cached artifact (no re-poll). Bump the salt to force
+# every live profile to re-forecast (e.g. after changing the request scaffolding).
+CERAMICS_CACHE_SALT = os.getenv("CERAMICS_CACHE_SALT", "ceramics-v1")
+
+# Model that writes the one-line pipeline stage blurbs shown during a live
+# forecast. Reuses the fast tag-picker model by default; falls back to committed
+# templates with no key (THE RULE: these are status lines, never a decision).
+CERAMICS_STAGE_BLURB_MODEL = os.getenv("CERAMICS_STAGE_BLURB_MODEL", KEYWORD_MODEL)
 
 
 def have_sybilion_key() -> bool:

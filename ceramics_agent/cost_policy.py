@@ -156,6 +156,8 @@ def decide_procurement(
     factors: dict[str, list[MonthForecast]],
     weights: CostWeights,
     params: HedgePolicyParams = CERAMICS_POLICY_PARAMS,
+    risk_premium: float = 0.0,
+    anchor: float | None = None,
 ) -> list[MonthDecision]:
     """Decide the per-month lock % from the weighted blended band + its drift.
 
@@ -163,13 +165,25 @@ def decide_procurement(
     forecast, decided against a single horizon-start anchor (the first month's
     blended level — the nearest-future cost, the ceramics analogue of "today's
     spot"). The resulting ``MonthDecision.hedge_ratio`` is the lock %.
+
+    ``risk_premium`` is an additive lock-floor add-on (default 0.0 → byte-identical
+    to the calm path). It mirrors :func:`gas_agent.hedge_policy.decide_all`'s own
+    ``risk_premium`` and is set only by :mod:`ceramics_agent.scenario` when a supply
+    shock lands, so the cost lock lifts in step with the gas hedge floor. It is still
+    the deterministic policy — never an LLM — that turns the premium into a lock %.
+
+    ``anchor`` overrides the horizon-start reference (default ``None`` → the calm
+    behaviour of using the first blended month). The shock path passes the *pre-shock*
+    nearest level so a uniform cost bump reads as rising drift, exactly the way the gas
+    shock keeps today's spot fixed while the forward bumps up.
     """
     blended = blended_index(factors, weights)
     if not blended:
         return []
     synthetic = [_synthetic_forecast(month) for month in blended]
-    anchor = blended[0].level  # nearest-future blended cost — the "today" reference
-    decisions = decide_all(synthetic, anchor, params)
+    # Nearest-future blended cost — the "today" reference (overridable for the shock path).
+    spot = blended[0].level if anchor is None else anchor
+    decisions = decide_all(synthetic, spot, params, risk_premium)
     # Relabel the reason so it reads as a cost-lock, not a gas hedge.
     return [_relabel(decision) for decision in decisions]
 

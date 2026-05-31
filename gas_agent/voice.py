@@ -116,18 +116,24 @@ def provider_order() -> list[str]:
     return ["nvidia", "local"]  # "auto" and "nvidia"
 
 
-def synthesize(text: str) -> VoiceClip | None:
+def synthesize(text: str, *, providers: list[str] | None = None) -> VoiceClip | None:
     """Narrate ``text``, honouring the provider order and the NVIDIA rate limit.
 
     Returns a :class:`VoiceClip`, or ``None`` when every eligible provider is
     unavailable (no key, over the limit, no local engine, or a failed call) — the
     caller then just hides the audio player.
+
+    ``providers`` overrides the configured order for this one call (default
+    ``None`` → :func:`provider_order`, i.e. today's behaviour unchanged). The
+    pipeline filler passes ``["local"]`` to force the free, instant local ``say``
+    voice so it never burns the NVIDIA free-tier window on throwaway chatter, while
+    the headline narration keeps using the configured order.
     """
     clean = (text or "").strip()
     if not clean:
         return None
 
-    for provider in provider_order():
+    for provider in (providers or provider_order()):
         if provider == "nvidia":
             if not config.have_nvidia_key():
                 continue

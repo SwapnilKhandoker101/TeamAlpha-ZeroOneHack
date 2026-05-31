@@ -123,3 +123,62 @@ def test_live_path_skips_factors_with_no_history(monkeypatch):
     job_id = cf.run_live_ceramics_forecast(object(), {"gas": {"2026-01-01": 1.0}})
     assert job_id.startswith("ceramics-")
     assert list(saved["content"]["factors"]) == ["gas"]
+
+
+# --------------------------------------------------------------------------- #
+# Cache-first plumbing — a deterministic combined-job id so re-submitting the
+# same profile reuses the cached artifact instead of re-polling four jobs.
+# --------------------------------------------------------------------------- #
+def test_combined_job_id_is_deterministic_and_signature_sensitive():
+    a = cf.combined_job_id("bowl|5000|14d|de")
+    assert a == cf.combined_job_id("bowl|5000|14d|de")  # same signature -> same id
+    assert a != cf.combined_job_id("tile|5000|14d|de")  # different signature -> different id
+    assert a.startswith("ceramics-")
+
+
+def test_live_artifact_exists_false_for_none_and_missing():
+    assert cf.live_artifact_exists(None) is False
+    assert cf.live_artifact_exists("definitely-not-a-cached-job") is False
+
+
+def test_ensure_returns_cached_job_without_polling(monkeypatch):
+    # Cache hit: ensure must return the deterministic id and never run the live path.
+    monkeypatch.setattr(cf, "live_artifact_exists", lambda job_id: True)
+
+    def fail_if_polled(*a, **k):
+        raise AssertionError("ensure_ceramics_forecast must not re-poll on a cache hit")
+
+    monkeypatch.setattr(cf, "run_live_ceramics_forecast", fail_if_polled)
+
+    job_id = cf.ensure_ceramics_forecast(object(), {}, signature="bowl|5000|14d|de")
+    assert job_id == cf.combined_job_id("bowl|5000|14d|de")
+
+
+def test_ensure_runs_live_under_the_deterministic_id_on_a_miss(monkeypatch):
+    # Cache miss: ensure must run the live path under the signature's stable id.
+    monkeypatch.setattr(cf, "live_artifact_exists", lambda job_id: False)
+    captured: dict = {}
+
+    def fake_run(client, base, *, job_id, soft_horizon):
+        captured["job_id"] = job_id
+        return job_id
+
+    monkeypatch.setattr(cf, "run_live_ceramics_forecast", fake_run)
+    sig = "tile|8000|21d|de"
+    job_id = cf.ensure_ceramics_forecast(object(), {}, signature=sig)
+    assert job_id == cf.combined_job_id(sig)
+    assert captured["job_id"] == cf.combined_job_id(sig)
+
+
+def test_ensure_refresh_repolls_even_on_a_cache_hit(monkeypatch):
+    # refresh=True (a chat impact invalidated a factor) forces a re-poll.
+    monkeypatch.setattr(cf, "live_artifact_exists", lambda job_id: True)
+    called = {"ran": False}
+
+    def fake_run(client, base, *, job_id, soft_horizon):
+        called["ran"] = True
+        return job_id
+
+    monkeypatch.setattr(cf, "run_live_ceramics_forecast", fake_run)
+    cf.ensure_ceramics_forecast(object(), {}, signature="bowl|5000|14d|de", refresh=True)
+    assert called["ran"] is True

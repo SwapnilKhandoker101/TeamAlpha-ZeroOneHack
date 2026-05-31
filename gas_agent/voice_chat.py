@@ -40,11 +40,24 @@ class ChatState:
     scenario_label: str = ""
     scenario_magnitude: float = 0.0
 
+    # Optional second-decision (ceramics) context — explanation-only, set by the app
+    # when the same buyer's ceramics line is on screen. All defaults leave the
+    # gas-only brief byte-identical, so existing callers are unaffected. The figures
+    # here are decided by the deterministic ceramics policy, never by this assistant.
+    ceramics_lock_ratio: float | None = None
+    ceramics_band_regime: str = ""
+    ceramics_supplier: str = ""
+    ceramics_channel: str = ""
+    ceramics_unit_margin: float | None = None
+    ceramics_scenario_lock: float | None = None  # the shocked lock when a shock is active
+
 
 _SYSTEM_PROMPT = (
-    "You are the voice assistant of a gas-hedging agent, answering a procurement "
-    "lead's spoken question. A deterministic policy has ALREADY decided the hedge "
-    "ratio; you only EXPLAIN the existing decision and the data behind it.\n\n"
+    "You are the voice assistant of a forecasting agent for a manufacturer, answering "
+    "a procurement lead's spoken question. The buyer faces two decisions — a gas hedge "
+    "ratio and, when shown, a ceramics input-cost lock — and a deterministic policy has "
+    "ALREADY decided BOTH; you only EXPLAIN the existing decisions and the data behind "
+    "them.\n\n"
     "Strict rules:\n"
     "- Answer ONLY from the brief below. Never invent drivers, numbers, suppliers, "
     "regions, or events.\n"
@@ -81,6 +94,29 @@ def _premium_clause(state: ChatState) -> str:
     return "No standing supply-risk premium (no supply-risk-region drivers dominate)."
 
 
+def _ceramics_clause(state: ChatState) -> str:
+    """A compact brief of the SECOND decision (the ceramics input-cost lock) when the
+    app supplies it, so the assistant can answer 'why this lock / which supplier' for
+    the ceramics line too — explanation-only, never re-deciding it. Empty when absent."""
+    if state.ceramics_lock_ratio is None:
+        return ""
+    bits = [
+        f"\nSECOND DECISION — ceramics line (also FINAL, decided by the deterministic "
+        f"cost policy): lock {state.ceramics_lock_ratio:.0%} of next quarter's input cost "
+        f"now ({state.ceramics_band_regime or 'normal'} blended cost band)."
+    ]
+    if state.ceramics_scenario_lock is not None:
+        bits.append(f" Under the active shock this lock moved to "
+                    f"{state.ceramics_scenario_lock:.0%}.")
+    if state.ceramics_supplier:
+        bits.append(f" Chosen supplier: {state.ceramics_supplier}.")
+    if state.ceramics_channel:
+        bits.append(f" Chosen sales channel: {state.ceramics_channel}.")
+    if state.ceramics_unit_margin is not None:
+        bits.append(f" Negotiated unit margin: EUR {state.ceramics_unit_margin:.2f}.")
+    return "".join(bits)
+
+
 def _build_factsheet(question: str, state: ChatState) -> str:
     quarter_label = " / ".join(d.month[:7] for d in state.decisions)
     rejected_examples = ", ".join(d.name for d in state.rejected_drivers[:3]) or "none"
@@ -89,7 +125,8 @@ def _build_factsheet(question: str, state: ChatState) -> str:
         f"Today's TTF spot price: EUR {state.spot_price:.0f}/MWh\n"
         f"Decision (deterministic policy, FINAL): lock {state.quarter_ratio:.0%} of next "
         f"quarter ({quarter_label}) forward now.\n"
-        f"{_scenario_clause(state)}\n{_premium_clause(state)}\n\n"
+        f"{_scenario_clause(state)}\n{_premium_clause(state)}\n"
+        f"{_ceramics_clause(state)}\n\n"
         f"Per-month detail:\n{_decision_lines(state.decisions)}\n\n"
         f"Most credible drivers (kept after curation), with region:\n"
         f"{_qa_driver_lines(state.kept_drivers)}\n\n"
@@ -120,12 +157,114 @@ def _fallback_answer(question: str, state: ChatState) -> str:
         f"the shocked band."
         if state.scenario_magnitude > 0 and state.scenario_label else ""
     )
+    ceramics_phrase = ""
+    if state.ceramics_lock_ratio is not None:
+        ceramics_phrase = (
+            f" On the ceramics line, the same deterministic approach locks "
+            f"{state.ceramics_lock_ratio:.0%} of next quarter's input cost"
+        )
+        if state.ceramics_scenario_lock is not None:
+            ceramics_phrase += f" (up to {state.ceramics_scenario_lock:.0%} under the shock)"
+        if state.ceramics_supplier:
+            ceramics_phrase += f", buying from {state.ceramics_supplier}"
+        ceramics_phrase += "."
     return (
         f"The agent locks {state.quarter_ratio:.0%} of next quarter ({quarter_label}) "
         f"forward, at a TTF spot of EUR {state.spot_price:.0f}/MWh. The size comes from "
         f"the forecast's confidence band, not its midpoint — a tighter band means a "
-        f"higher lock. {driver_phrase}.{premium_phrase}{scenario_phrase}"
+        f"higher lock. {driver_phrase}.{premium_phrase}{scenario_phrase}{ceramics_phrase}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# "About this app" — the agent can explain itself (W11). Explanation-only: this
+# describes the SYSTEM, it never emits or alters a decision number. Grounded on a
+# single factual overview sourced from CLAUDE.md so it can't drift into invention.
+# --------------------------------------------------------------------------- #
+APP_OVERVIEW = (
+    "This is a forecasting-AI decision agent for a mid-size German glass & ceramics "
+    "manufacturer, built on the Sybilion probabilistic forecasting API. From one company "
+    "description it makes TWO decisions:\n"
+    "1) GAS HEDGE — what share of next quarter's natural gas (the Dutch TTF benchmark) to "
+    "lock in forward now versus buy later on the spot market. It is NOT a price prediction: "
+    "Sybilion's point forecast for gas is weak (~28% error), so the decision is sized from "
+    "the forecast's CONFIDENCE BAND (a tighter band → lock more) plus a curated mix of "
+    "credible supply/demand drivers — never the point estimate.\n"
+    "2) CERAMICS LOCK — for one production run, how much blended input cost (gas, clay, "
+    "power, freight) to lock now, which supplier to buy from, and which sales channel to "
+    "sell through. The lock % reuses the SAME hedge-policy engine on a 4-factor cost band.\n"
+    "THE CORE PRINCIPLE: the LLM never computes a decision number. Deterministic policy code "
+    "computes every hedge ratio, lock %, supplier/channel score, negotiated quote and backtest "
+    "result, so identical inputs always reproduce the identical decision and every number is "
+    "auditable. The LLM only PREPARES inputs (it picks Sybilion filters and reads a supply "
+    "shock's severity from free text) and EXPLAINS outputs (it narrates the already-decided "
+    "numbers). The app runs fully offline with no API keys (a committed cached forecast plus "
+    "template narration). A live supply-shock scenario lets you change an assumption mid-run and "
+    "watch BOTH decisions adapt instantly, and reproducible backtests show the policy beats "
+    "naive baselines. Built with Sybilion (forecasts), Featherless (LLM narration), NVIDIA Riva "
+    "(voice), and Streamlit + Plotly (the dashboard and globe)."
+)
+
+# Substring cues that a message is asking about the app / methodology itself, rather
+# than about the current decision (those stay with answer_question). Deterministic.
+_ABOUT_TRIGGERS: tuple[str, ...] = (
+    "what is this", "what's this", "what is the app", "what does this app",
+    "what does the app", "about this app", "about the app", "what can you do",
+    "what do you do", "who is this for", "who's this for", "why was it built",
+    "why was this built", "why build", "why this design", "why is it built",
+    "why did you build", "how does this app", "how does the app", "how does it work",
+    "how do you work", "how does the hedge ratio work", "how is the hedge ratio",
+    "how does the lock work", "how is the lock computed", "how do you decide",
+    "how does it decide", "what is sybilion", "what's sybilion", "explain the app",
+    "explain this app", "tell me about this app", "what is this app",
+)
+
+_ABOUT_SYSTEM = (
+    "You are the assistant of a forecasting-AI decision agent, answering a question about "
+    "WHAT THE APP IS and HOW IT WORKS. Answer ONLY from the overview below. Do NOT invent "
+    "features, and do NOT state or imply any hedge ratio or lock percentage — this is a "
+    "description of the system, not a decision. 2-5 sentences, plain and conversational "
+    "(it may be read aloud), no headings or bullet lists."
+)
+
+
+def is_about_question(message: str) -> bool:
+    """True when a chat message is asking about the app / methodology itself (so the
+    router answers from :data:`APP_OVERVIEW` instead of the current decision)."""
+    lower = (message or "").lower()
+    return any(trigger in lower for trigger in _ABOUT_TRIGGERS)
+
+
+def _about_fallback(question: str) -> str:
+    """Deterministic self-description for when Featherless is unavailable — captures the
+    essence of :data:`APP_OVERVIEW` and THE RULE, with no decision number."""
+    return (
+        "This is a forecasting-AI decision agent for a German glass & ceramics maker, built on "
+        "the Sybilion probabilistic forecasting API. From one company description it makes two "
+        "auditable decisions — how much gas to lock forward, and how to run a ceramics production "
+        "run (input-cost lock, supplier, sales channel) — sizing each from a forecast confidence "
+        "band rather than a point prediction. Crucially, the LLM never computes a number: "
+        "deterministic policy code decides every figure and the model only prepares inputs and "
+        "explains the result, so the same inputs always reproduce the same decision. It runs "
+        "offline with no keys, and a live supply-shock scenario lets you watch both decisions adapt."
+    )
+
+
+def answer_about(question: str) -> Explanation:
+    """Answer an 'about this app' question from :data:`APP_OVERVIEW` (explanation-only).
+    Featherless writes the prose; with no key (or on failure) the deterministic
+    self-description answers. Never emits a decision number."""
+    question = (question or "").strip()
+    if not question or not llm.featherless_available():
+        return Explanation(text=_about_fallback(question), source="fallback")
+    user = f"QUESTION: {question}\n\nAPP OVERVIEW:\n{APP_OVERVIEW}"
+    try:
+        text = llm.chat_text(EXPLANATION_MODEL, _ABOUT_SYSTEM, user, temperature=0.2, max_tokens=320)
+    except llm.LLMUnavailable:
+        return Explanation(text=_about_fallback(question), source="fallback")
+    if not text:
+        return Explanation(text=_about_fallback(question), source="fallback")
+    return Explanation(text=text, source="llm", model=EXPLANATION_MODEL)
 
 
 def answer_question(

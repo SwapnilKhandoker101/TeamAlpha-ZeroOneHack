@@ -42,7 +42,7 @@ assumption, not a hidden one.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import mean, pstdev
 
 from gas_agent import config
@@ -87,6 +87,8 @@ class CeramicsBacktestRow:
     cheap_margin: float
     agent_supplier: str
     agent_channel: str
+    # --- extra baseline (W12 — additive; default 0.0 leaves the row otherwise unchanged) ---
+    top_ranked_margin: float = 0.0  # always the best-SCORED supplier, ignoring the lock routing
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,9 @@ class CeramicsBacktestResult:
     agent: StrategyMargin
     random_: StrategyMargin
     cheap: StrategyMargin
+    # --- extra baseline (W12 — additive; the headline trio above is unchanged) ---
+    top_ranked: StrategyMargin = field(
+        default_factory=lambda: StrategyMargin("always top-ranked", 0.0, 0.0, 0.0, 0.0))
 
     @property
     def n_months(self) -> int:
@@ -126,6 +131,33 @@ class CeramicsBacktestResult:
         if self.cheap.mean == 0:
             return 0.0
         return 100.0 * (self.agent.mean - self.cheap.mean) / abs(self.cheap.mean)
+
+    @property
+    def agent_vs_top_ranked_pct(self) -> float:
+        """Agent mean margin vs always committing to the best-SCORED supplier, ignoring
+        the lock routing (% of top-ranked; +ve = the lock-routed pick books more). This
+        isolates the value of routing the supplier by the lock stance: at a mid lock the
+        agent takes the balanced, more-reliable mid supplier, whose reliability haircut is
+        gentler than the top-scored (cheapest) supplier's."""
+        if self.top_ranked.mean == 0:
+            return 0.0
+        return 100.0 * (self.agent.mean - self.top_ranked.mean) / abs(self.top_ranked.mean)
+
+    @property
+    def extended_verdict(self) -> str:
+        """The extra baseline as a second line under :pyattr:`verdict` (additive — ``verdict``
+        stays byte-identical). Reports how the lock-routed supplier pick compares to blindly
+        always taking the top-scored supplier."""
+        if not self.rows:
+            return ""
+        delta = self.agent_vs_top_ranked_pct
+        word = "above" if delta >= 0 else "below"
+        return (
+            f"Versus always committing to the top-scored supplier (ignoring the lock "
+            f"routing), the agent books €{self.top_ranked.mean:,.0f}/month there and is "
+            f"{abs(delta):.0f}% {word} it — the lock stance routes to the balanced, more-"
+            f"reliable supplier whose margin survives the reliability haircut better."
+        )
 
     @property
     def volatility_drop_vs_random(self) -> float:
@@ -202,11 +234,14 @@ def run_ceramics_backtest(
     # the replay; its channel is re-picked per month (season-aware).
     kept_suppliers = curate_suppliers(timeline_days).kept
     agent_supplier_pick = select_supplier(kept_suppliers, lock_ratio)
+    # S4 baseline: always the best-SCORED supplier, ignoring the lock routing.
+    top_ranked_supplier = kept_suppliers[0].supplier if kept_suppliers else suppliers[0]
 
     rows: list[CeramicsBacktestRow] = []
     agent_margins: list[float] = []
     random_margins: list[float] = []
     cheap_margins: list[float] = []
+    top_ranked_margins: list[float] = []
 
     for record in history:
         product = get_product(record.product_id)
@@ -235,14 +270,23 @@ def run_ceramics_backtest(
             record.month, record.units, timeline_days, competition,
         )
 
+        # --- S4 always top-ranked supplier (+ the season channel) -----------
+        # No RNG here, so S2's seeded sequence is untouched and S1-S3 stay byte-identical.
+        top = negotiate(
+            product, top_ranked_supplier, agent_channel, factors,
+            record.month, record.units, timeline_days, competition,
+        )
+
         # Realized margin = nominal × the chosen supplier's reliability (the haircut).
         agent_realized = _realized(agent.total_margin, agent_supplier)
         random_realized = _realized(rnd.total_margin, rnd_supplier)
         cheap_realized = _realized(cheap.total_margin, cheapest)
+        top_ranked_realized = _realized(top.total_margin, top_ranked_supplier)
 
         agent_margins.append(agent_realized)
         random_margins.append(random_realized)
         cheap_margins.append(cheap_realized)
+        top_ranked_margins.append(top_ranked_realized)
         rows.append(
             CeramicsBacktestRow(
                 month=record.month,
@@ -253,6 +297,7 @@ def run_ceramics_backtest(
                 cheap_margin=cheap_realized,
                 agent_supplier=agent_supplier.name,
                 agent_channel=agent_channel.name,
+                top_ranked_margin=top_ranked_realized,
             )
         )
 
@@ -261,10 +306,12 @@ def run_ceramics_backtest(
         agent=_margin_stats("agent policy", agent_margins),
         random_=_margin_stats("random pick", random_margins),
         cheap=_margin_stats("cheap + best margin", cheap_margins),
+        top_ranked=_margin_stats("always top-ranked", top_ranked_margins),
     )
 
 
 if __name__ == "__main__":  # quick manual check off the committed mock forecast
+    from ceramics_agent.catalog import EXTENDED_HISTORICAL_SALES
     from ceramics_agent.cost_policy import decide_procurement, default_weights, quarter_lock_ratio
     from ceramics_agent.forecast import load_ceramics_forecast
 
@@ -277,7 +324,14 @@ if __name__ == "__main__":  # quick manual check off the committed mock forecast
         print(
             f"  {row.month}  {row.product:22s} x{row.units:5d}  "
             f"agent €{row.agent_margin:10,.0f}  random €{row.random_margin:10,.0f}  "
-            f"cheap €{row.cheap_margin:10,.0f}  [{row.agent_supplier} / {row.agent_channel}]"
+            f"cheap €{row.cheap_margin:10,.0f}  top €{row.top_ranked_margin:10,.0f}  "
+            f"[{row.agent_supplier} / {row.agent_channel}]"
         )
     print()
     print(result.verdict)
+    print(result.extended_verdict)
+    print()
+    longer = run_ceramics_backtest(factors, lock, records=EXTENDED_HISTORICAL_SALES)
+    print(f"Robustness — {longer.n_months}-month replay: agent €{longer.agent.mean:,.0f}/mo, "
+          f"{longer.agent_vs_random_pct:+.0f}% vs random, {longer.agent_vs_cheap_pct:+.0f}% vs cheap, "
+          f"{longer.agent_vs_top_ranked_pct:+.0f}% vs top-ranked.")

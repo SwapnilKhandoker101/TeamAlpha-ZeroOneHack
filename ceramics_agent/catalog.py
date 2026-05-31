@@ -248,6 +248,78 @@ HISTORICAL_SALES: list[SalesRecord] = [
 ]
 
 
+def _prior_year(records: list[SalesRecord], volume_factor: float) -> list[SalesRecord]:
+    """The 12 months one year *earlier*, generated deterministically from ``records``.
+
+    Each record's month is shifted back a year and its volume scaled by
+    ``volume_factor`` (a stated year-on-year growth assumption — the business was a bit
+    smaller a year ago); the channel mix and achieved margin are carried over. No RNG,
+    so the prior year is byte-identical run-to-run — it just lengthens the replay."""
+    earlier: list[SalesRecord] = []
+    for record in records:
+        year, month = record.month.split("-")
+        earlier.append(SalesRecord(
+            month=f"{int(year) - 1}-{month}",
+            product_id=record.product_id,
+            units=round(record.units * volume_factor),
+            channel_mix=dict(record.channel_mix),
+            achieved_margin=record.achieved_margin,
+        ))
+    return earlier
+
+
+# A 24-month replay window for the backtest's robustness view (W12). The most recent
+# 12 months are the committed HISTORICAL_SALES verbatim (so the headline 12-month
+# backtest is unchanged); the earlier 12 are a deterministic ~8%-smaller prior year.
+# This is an *additional* replay — the default backtest still runs on HISTORICAL_SALES.
+EXTENDED_HISTORICAL_SALES: list[SalesRecord] = (
+    _prior_year(HISTORICAL_SALES, volume_factor=0.92) + HISTORICAL_SALES
+)
+
+
+# --------------------------------------------------------------------------- #
+# Geography — where suppliers source from, and where channel demand sits
+# --------------------------------------------------------------------------- #
+# These drive the ceramics globe's two layers (where to buy / where to sell).
+# They are display-only — they place an already-decided supplier or an
+# already-scored channel onto a sphere; no decision number is read from them.
+
+# Supplier short region code → the globe display name (matches gas_agent.geo's
+# REGION_COORDS keys so the shared coordinate table places them).
+SUPPLIER_REGION_NAMES: dict[str, str] = {
+    "AT": "Austria",
+    "PL": "Poland",
+    "IT": "Italy",
+    "DE": "Germany",
+}
+
+# Where each sales channel's demand physically sits — the "where to sell" layer.
+# Each channel's weights sum to 1.0; they split that channel's demand potential
+# across its destination markets (display names match the shared coordinate table).
+CHANNEL_DEMAND_REGIONS: dict[str, tuple[tuple[str, float], ...]] = {
+    # EU wholesale core
+    "wholesale": (("Germany", 0.40), ("France", 0.30), ("Italy", 0.30)),
+    # DACH hospitality
+    "hospitality": (("Germany", 0.50), ("Austria", 0.30), ("Switzerland", 0.20)),
+    # Global online-export hubs
+    "online": (("United States of America", 0.40), ("United Kingdom", 0.30), ("Germany", 0.30)),
+}
+
+
+def average_channel_mix() -> dict[str, float]:
+    """Each channel's mean share of units across :data:`HISTORICAL_SALES`.
+
+    The historical "where the volume actually flowed" weight for the demand-market
+    globe layer — a channel that carried more past volume sizes larger. Deterministic
+    (a plain mean over the committed history)."""
+    totals = {cid: 0.0 for cid in CHANNELS}
+    for record in HISTORICAL_SALES:
+        for cid, share in record.channel_mix.items():
+            totals[cid] = totals.get(cid, 0.0) + share
+    n = len(HISTORICAL_SALES) or 1
+    return {cid: total / n for cid, total in totals.items()}
+
+
 # --------------------------------------------------------------------------- #
 # Credibility whitelists / blacklists (substring, case-insensitive)
 # --------------------------------------------------------------------------- #

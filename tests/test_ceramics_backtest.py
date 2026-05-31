@@ -71,3 +71,44 @@ def test_realized_margins_carry_the_reliability_haircut():
     assert all(row.agent_margin > 0 for row in result.rows)
     # The agent's supplier is fixed across the replay (lock-routed + timeline).
     assert len({row.agent_supplier for row in result.rows}) == 1
+
+
+# --------------------------------------------------------------------------- #
+# W12 — extra baseline (always top-ranked) + longer replay (additive)
+# --------------------------------------------------------------------------- #
+def test_top_ranked_baseline_is_populated_and_does_not_disturb_the_headline():
+    factors, lock = _factors_and_lock()
+    result = run_ceramics_backtest(factors, lock)
+    # S4 is recorded for every row and aggregates into its own stat...
+    assert all(row.top_ranked_margin > 0 for row in result.rows)
+    assert result.top_ranked.mean > 0
+    assert isinstance(result.agent_vs_top_ranked_pct, float)
+    # ...without disturbing the headline trio (the agent still beats random by the same gap).
+    assert result.agent.mean > result.random_.mean
+    assert "top-scored supplier" in result.extended_verdict
+
+
+def test_extra_baseline_adds_no_rng_so_random_is_byte_identical():
+    # S4 makes no RNG draws, so the seeded random baseline is identical to a run
+    # that (hypothetically) had no S4 — proven here by reproducibility across runs.
+    factors, lock = _factors_and_lock()
+    a = run_ceramics_backtest(factors, lock)
+    b = run_ceramics_backtest(factors, lock)
+    assert [r.random_margin for r in a.rows] == [r.random_margin for r in b.rows]
+    assert a.top_ranked.mean == b.top_ranked.mean
+
+
+def test_extended_24_month_replay_keeps_the_recent_year_and_holds_the_edge():
+    from ceramics_agent.catalog import EXTENDED_HISTORICAL_SALES, HISTORICAL_SALES
+
+    # The extended window is exactly the prior year + the committed recent year.
+    assert len(EXTENDED_HISTORICAL_SALES) == 24
+    assert EXTENDED_HISTORICAL_SALES[-12:] == HISTORICAL_SALES  # recent year byte-identical
+    assert [r.month for r in EXTENDED_HISTORICAL_SALES[:12]] == [
+        f"{int(r.month[:4]) - 1}-{r.month[5:]}" for r in HISTORICAL_SALES]  # prior year
+
+    factors, lock = _factors_and_lock()
+    longer = run_ceramics_backtest(factors, lock, records=EXTENDED_HISTORICAL_SALES)
+    assert longer.n_months == 24
+    assert longer.agent.mean > longer.random_.mean  # the edge holds over the longer replay
+    assert longer.agent_vs_random_pct > 0
