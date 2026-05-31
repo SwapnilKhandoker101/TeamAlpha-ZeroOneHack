@@ -1,0 +1,11 @@
+{
+  "scenarios": [
+    {
+      "product": "bowl",
+      "gas_exposure": "medium",
+      "slug": "scn-bowl-medium",
+      "ceramics_ref": "_shared",
+      "label": "bowl \u00b7 medium-gas"
+    }
+  ]
+}

@@ -144,8 +144,10 @@ hackathon/
 │   ├── explanation_agent.py     # LLM narrates the already-decided ratio
 │   ├── decision_backtest.py     # replay vs 0/50/100% + seeded random ratio + shocked (W12)
 │   ├── geo.py                   # country coords + aggregation + per-country brief
-│   ├── sybilion_client.py       # REST client + disk cache + artifact parsers
-│   ├── transcribe.py            # push-to-talk ASR ladder (NVIDIA Riva → HF Whisper → None)
+│   ├── sybilion_client.py       # REST client + cache→scenarios resolver + non-blocking poll (W17/W18)
+│   ├── scenarios.py             # W17: committed scenario library + deterministic nearest-match
+│   ├── tour.py                  # W16: voice-guided-tour beats + globe poses (pure; local-voice synth)
+│   ├── transcribe.py            # push-to-talk ASR ladder: NVIDIA Riva → HF Whisper (router) → local Whisper (offline) → None
 │   ├── voice_chat.py            # grounded Q&A + APP_OVERVIEW self-knowledge (explain-only, W11)
 │   └── voice.py                 # TTS: NVIDIA Riva + local `say`; additive synthesize(providers=…)
 ├── ceramics_agent/              # SECOND AGENT — mirrors gas_agent/ (imports gas, never edits it)
@@ -163,17 +165,22 @@ hackathon/
 │   ├── scenario.py              # W6: one shock re-decides ceramics too (factor-routed, deterministic)
 │   ├── geo.py                   # W5: globe both layers — where to sell / where to buy (reuses gas geo)
 │   └── dashboard.py             # the ceramics SECTION (tabs dropped — render_ceramics_tab + globe)
+├── scenarios/                   # W17: COMMITTED real Sybilion scenario library (offline-reproducible)
+│   ├── index.json               # the (product × gas_exposure) grid → slug map
+│   ├── _shared/ceramics_forecast.json   # the product-independent 4-factor ceramics forecast
+│   └── scn-<product>-<gas>/      # one real gas forecast per cell (mirrors a cache job dir)
 ├── .streamlit/
-│   └── config.toml              # W8: professional dark theme (palette behind the CSS layer)
+│   └── config.toml              # W13: professional LIGHT theme (palette behind the CSS layer)
 ├── scripts/
 │   ├── build_ttf_series.py      # regenerate data/ttf_series.json from Yahoo TTF=F
 │   ├── save_cached_artifact.py  # import an MCP-exported artifact into cache/<job>/
 │   ├── build_voiceover.py       # pre-synthesise cache/audio/{golden,shock}.wav
-│   └── build_ceramics_forecast.py   # generate & commit cache/mock_ceramics_forecast.json
+│   ├── build_ceramics_forecast.py   # generate & commit cache/mock_ceramics_forecast.json
+│   └── build_scenarios.py       # W17: build the scenario library (--seed offline | live grid, resumable)
 ├── REPORT.md                    # submission write-up (TL;DR, approach, real numbers, credits)
 ├── README.md                    # clean-checkout setup/run + no-keys demo + what's live vs mocked
 ├── requirements.txt             # exported from uv.lock so `pip install -r` works on a clean checkout
-├── tests/                       # 270 tests, all green (offline, deterministic)
+├── tests/                       # 299 tests, all green (offline, deterministic)
 └── docs/
     ├── APP_GUIDE.md             # user guide (how it works, how we know it's good)
     ├── ARCHITECTURE.md          # build & design-rationale (why each choice)
@@ -188,11 +195,13 @@ hackathon/
 uv sync                              # install deps
 cp .env.example .env                 # optional: add real keys (demo runs without them)
 uv run streamlit run app.py          # the dashboard — one page, both decisions, runs keyless
-uv run pytest -q                     # 270 tests, all pass (offline, deterministic)
+uv run pytest -q                     # 299 tests, all pass (offline, deterministic)
 uv run python -m gas_agent.decision_backtest   # gas backtest verdict (+ extended baselines + shocked)
 uv run python -m ceramics_agent.backtest       # ceramics backtest verdict (+ top-ranked + 24-month)
 uv run python scripts/build_voiceover.py       # regenerate narration into cache/audio/
 uv run python scripts/build_ceramics_forecast.py  # regenerate the committed ceramics mock
+uv run python scripts/build_scenarios.py --seed   # seed the scenario library offline (no key)
+uv run python scripts/build_scenarios.py          # build the full live scenario grid (needs key; ~11 min/cell)
 ```
 
 - **uv** is the package manager. Python ≥ 3.11 (dev on 3.13).
@@ -203,16 +212,47 @@ uv run python scripts/build_ceramics_forecast.py  # regenerate the committed cer
 
 ## 5. Current state (as of 2026-05-31)
 
-**Everything is built and verified, including the full unified-app wave (W1–W12).**
-All three judging axes are covered. **270 tests pass** (offline, deterministic). The
-app was re-verified end-to-end in the browser: intake → pipeline animation → both
-decisions, the globe toggles sell/buy, the gas backtest shows five baselines, the
-ceramics backtest shows four + a 24-month robustness line, the chat explains itself,
-and **zero Streamlit exceptions**. The **gas decision math is byte-identical** (calm
-quarter ratio 30.5%, standing premium +6.9%, curation 25 kept / 6 rejected, backtest
-verdict unchanged — see the tables below). New live numbers from W12 are in the
-sub-tables further down. The unified-app design is summarised in §1 ("Now unified
-into one chat-centric single page"); `docs/` (APP_GUIDE / ARCHITECTURE) still describe
+**Everything is built and verified — the unified-app wave (W1–W12) AND the "narrated
+demo" wave (W13–W18).** All three judging axes are covered. **299 tests pass** (offline,
+deterministic). The **gas decision math is byte-identical** (calm quarter ratio 30.5%,
+standing premium +6.9%, curation 25 kept / 6 rejected, backtest verdict unchanged).
+
+The **"narrated demo" wave (W13–W18)** — all built, browser-verified, zero Streamlit
+exceptions:
+- **W13 — light theme as the default.** `.streamlit/config.toml` (`base="light"`) + the
+  CSS layer + the two globes recoloured to light tones. Reads cleanly on every surface.
+- **W14 — voice at intake.** An `st.audio_input` mic on the intake screen transcribes
+  into the description box (reuses `transcribe`); hidden with no ASR key.
+- **W15 — settings at intake.** An "⚙️ Advanced" expander exposes live-forecast +
+  classify + free-form toggles (same session keys as the results-screen controls, so they
+  stay in sync); opting into live at intake auto-starts the run on submit.
+- **W16 — voice-guided tour (the centerpiece).** A spoken question's answer plays while
+  the page **auto-scrolls** to the sections it discusses and the **globe rotates/zooms**
+  to the country it names. `gas_agent/tour.py` builds deterministic *beats* (sentence +
+  anchor + globe pose) from the EXISTING answer text (no LLM re-decide) and synthesises
+  them with the **local** voice; `render_tour` is one `components.html` JS bridge driving
+  the parent page (`window.parent.document` scroll + `window.parent.Plotly` globe), with
+  graceful degradation (no parent/Plotly → audio-only; autoplay blocked → timer-advance).
+  Verified live: all 7 scroll anchors present, `Plotly.relayout` rotates the globe, the
+  tour iframe mounts with synthesised beats.
+- **W17 — scenario library + nearest-match.** Pre-fetched **real** Sybilion forecasts,
+  **committed** under `scenarios/`, retrieved by a deterministic match on
+  (product × gas_exposure) — the only dims a forecast depends on (competition / quantity /
+  timeline are deterministic downstream), so a **9-cell grid + one shared ceramics forecast
+  covers everything**. The artifact loader reads cache→scenarios, so a match flows through
+  the existing render path. Seeded offline now (the committed cached job → `scn-bowl-medium`
+  + the mock → `_shared`); `scripts/build_scenarios.py` builds the full live grid (resumable).
+  The default demo matches `scn-bowl-medium` exactly → identical numbers to the pinned job.
+- **W18 — non-blocking live forecast.** A real Sybilion job can take ~11 min; the old poll
+  was blocking with a 180 s timeout. Now: submit all 5 jobs up front (parallel) and poll one
+  tick per rerun inside `@st.fragment(run_every="4s")` — no app freeze — with a progress
+  panel, Cancel, ~15-min deadline, and per-agent fallback to the matched scenario / mock.
+  The blocking helper (timeout raised to 900 s) is reused by the offline batch.
+
+THE RULE / offline floor / determinism all hold; the only `gas_agent/` edits remain
+additive & behaviour-preserving (the new `tour.py` / `scenarios.py` are new files; the
+`sybilion_client` split + raised timeout + cache→scenarios resolver are additive). New W12
+live numbers are in the sub-tables below. `docs/` (APP_GUIDE / ARCHITECTURE) still describe
 the pre-unification tabbed layout and are the next doc to refresh if time allows.
 
 A second wave (the `edges.md` follow-up) is also built and verified:

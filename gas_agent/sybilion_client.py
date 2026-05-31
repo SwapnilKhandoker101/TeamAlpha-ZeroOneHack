@@ -92,13 +92,36 @@ def job_cache_dir(job_id: str) -> Path:
     return config.CACHE_DIR / job_id
 
 
+def _artifact_name(name: str) -> str:
+    return name if name.endswith(".json") else f"{name}.json"
+
+
+def cache_artifact_path(job_id: str, name: str) -> Path:
+    """The WRITE path for an artifact — always under the working ``cache/`` (so a live
+    refresh never overwrites a committed scenario)."""
+    return job_cache_dir(job_id) / _artifact_name(name)
+
+
+def scenario_artifact_path(job_id: str, name: str) -> Path:
+    """The committed scenario-library path for a slug (read-only, W17)."""
+    return config.SCENARIOS_DIR / job_id / _artifact_name(name)
+
+
 def artifact_path(job_id: str, name: str) -> Path:
-    name = name if name.endswith(".json") else f"{name}.json"
-    return job_cache_dir(job_id) / name
+    """READ-resolve an artifact: the working ``cache/`` first, then the committed
+    ``scenarios/`` library, else the cache path (so a matched library scenario flows
+    through the existing render path unchanged — a scenario dir is just a job dir)."""
+    cache_path = cache_artifact_path(job_id, name)
+    if cache_path.exists():
+        return cache_path
+    scenario_path = scenario_artifact_path(job_id, name)
+    if scenario_path.exists():
+        return scenario_path
+    return cache_path
 
 
 def save_artifact(job_id: str, name: str, content: dict) -> Path:
-    path = artifact_path(job_id, name)
+    path = cache_artifact_path(job_id, name)  # writes always go to the working cache
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(content, indent=2))
     return path
@@ -212,14 +235,49 @@ def _status_from_descriptor(descriptor: dict) -> str:
     return str(raw).strip().lower()
 
 
+# Public descriptor readers + single-step building blocks, so a non-blocking caller
+# (the app's poll-across-reruns live run, W18) can submit once and poll one tick per
+# rerun without the blocking loop below. The blocking helper now composes these too.
+def job_id_of(descriptor: dict) -> str | None:
+    """The job id from a submit/status descriptor (tolerant of key spellings)."""
+    return _job_id_from_descriptor(descriptor)
+
+
+def status_of(descriptor: dict) -> str:
+    """The lowercased status from a descriptor (``""`` when unknown)."""
+    return _status_from_descriptor(descriptor)
+
+
+def is_terminal(status: str) -> bool:
+    """True once a job has reached a terminal status (completed/failed)."""
+    return status in TERMINAL_STATUSES
+
+
+def poll_once(client: SybilionClient, job_id: str) -> str:
+    """One non-blocking status poll — the across-reruns building block (no sleep)."""
+    return _status_from_descriptor(client.get_forecast(job_id))
+
+
+def fetch_forecast_artifacts(client: SybilionClient, job_id: str) -> None:
+    """Fetch + cache the four artifacts for a finished job under ``cache/<job_id>/``.
+    Shared by the blocking helper and the non-blocking live run."""
+    for name in FORECAST_ARTIFACTS:
+        save_artifact(job_id, name, client.get_artifact(job_id, name))
+
+
 def run_live_forecast(
     client: SybilionClient,
     payload: dict,
     *,
     poll_interval: float = 3.0,
-    timeout: float = 180.0,
+    timeout: float = 900.0,
 ) -> str:
     """Submit a forecast, poll until it finishes, cache its artifacts, return the id.
+
+    BLOCKING — used by the offline batch (``scripts/build_scenarios.py``) where a long
+    wait is fine; the in-app live refresh uses the non-blocking submit/``poll_once``
+    building blocks instead (W18). The default ``timeout`` is 15 minutes because a real
+    Sybilion job can take ~11 minutes.
 
     Non-destructive by design: this fetches and saves the four artifacts under
     ``cache/<job_id>/`` but deliberately does **not** call :func:`set_latest_job`,
@@ -243,13 +301,12 @@ def run_live_forecast(
                 f"(last status: {status or 'unknown'})"
             )
         time.sleep(poll_interval)
-        status = _status_from_descriptor(client.get_forecast(job_id))
+        status = poll_once(client, job_id)
 
     if status == "failed":
         raise RuntimeError(f"Sybilion job {job_id} reported failure")
 
-    for name in FORECAST_ARTIFACTS:
-        save_artifact(job_id, name, client.get_artifact(job_id, name))
+    fetch_forecast_artifacts(client, job_id)
     return job_id
 
 

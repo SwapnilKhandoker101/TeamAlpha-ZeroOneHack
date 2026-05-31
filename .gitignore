@@ -18,6 +18,10 @@ cache/**/*.json
 # Pre-synthesised narration (regenerable: scripts/build_voiceover.py)
 cache/audio/
 
+# The scenario library (scenarios/) is intentionally COMMITTED — it holds real
+# pre-fetched Sybilion forecasts that ship in a clean checkout so the demo is
+# offline-reproducible (W17). Nothing above ignores it; this note records the intent.
+
 # OS
 .DS_Store
 .claude/

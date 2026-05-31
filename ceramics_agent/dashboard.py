@@ -24,6 +24,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from gas_agent import tour
+
 from ceramics_agent.catalog import list_products
 from ceramics_agent.cost_policy import CostWeights
 from ceramics_agent.explanation import explain_recommendation
@@ -175,11 +177,11 @@ def _ceramics_globe_figure(points, *, layer_label: str, color: str) -> go.Figure
             mode="markers", name=layer_label, hoverinfo="text",
             marker=dict(
                 size=[14 + 34 * (p.kept_importance / top) for p in points],
-                color=color, opacity=0.85, line=dict(width=1, color="white")),
+                color=color, opacity=0.9, line=dict(width=1, color="#475569")),
         ))
     figure.update_geos(
-        projection_type="orthographic", showland=True, landcolor="#1f2937",
-        showocean=True, oceancolor="#0b1220", showcountries=True, countrycolor="#374151",
+        projection_type="orthographic", showland=True, landcolor="#e2e8f0",
+        showocean=True, oceancolor="#eaf2fb", showcountries=True, countrycolor="#cbd5e1",
         showcoastlines=False, bgcolor="rgba(0,0,0,0)",
         projection_rotation=dict(lon=15, lat=35),
     )
@@ -212,6 +214,7 @@ def _render_ceramics_globe(rec: Recommendation) -> None:
     opens an explanation-only Featherless brief on the country."""
     from ceramics_agent import geo
 
+    st.markdown(tour.anchor_html("cer_map"), unsafe_allow_html=True)
     st.subheader("Where to sell, and where to buy — the agent's map")
     layer = st.radio(
         "Globe layer", ["Where to sell (demand)", "Where to buy (sourcing)"],
@@ -362,6 +365,7 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
     quantity / timeline / competition / cost weights), so the same description drives
     both decisions. ``job_id`` is the resolved forecast job (a live ceramics job when
     the unified Live toggle is on, else ``None`` → the committed mock)."""
+    st.markdown(tour.anchor_html("ceramics"), unsafe_allow_html=True)
     st.header("② How should we run the ceramics line?")
     st.caption(
         "For one production run, the agent decides three things — how much input cost to "

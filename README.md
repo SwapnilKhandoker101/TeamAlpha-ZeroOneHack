@@ -65,20 +65,38 @@ forecast is and whether the prose/voice are model-written. Run the NVIDIA voice 
 
 | Piece | Default (no keys) | With keys |
 |-------|-------------------|-----------|
-| Gas TTF forecast | committed cached Sybilion job | live submit→poll (toggle) |
-| Ceramics 4-factor cost forecast | committed mock | live 4-factor Sybilion (toggle) |
+| Gas TTF forecast | committed scenario library / cached job | live submit→poll (non-blocking, toggle) |
+| Ceramics 4-factor cost forecast | committed scenario / mock | live 4-factor Sybilion (toggle) |
 | Narration / chat / briefs | deterministic templates | Featherless LLM |
-| Voice in / out | hidden (text works) | NVIDIA Riva → local `say` / HF Whisper |
+| Voice in / out | local Whisper (offline) if `--extra localasr`, else hidden | NVIDIA Riva → HF Whisper → local Whisper |
 | **Every decision number** | **deterministic — identical** | **identical** |
+
+**Voice input, key-free:** install the offline speech-to-text with `uv sync --extra localasr`
+(adds `faster-whisper`; the model downloads once, then runs on CPU). The mic then works with
+**no cloud key** — the ASR ladder is NVIDIA → HuggingFace → **local Whisper**. Force offline-only
+with `ASR_PROVIDER=local`. (The HuggingFace path uses the current `router.huggingface.co`
+endpoint; a token needs the "Inference Providers" permission.)
+
+**Scenario library (the "feels live, is real" path):** describing a business matches the
+nearest **pre-fetched real Sybilion forecast** committed under `scenarios/` (instant, offline,
+reproducible) — so the stage never waits on the ~11-min live call. Live forecasting is still
+available on demand (the Advanced toggle); it submits all jobs up front and **polls in the
+background** without freezing, falling back to the matched scenario if anything is unreachable.
+
+**Talk to it (voice-guided tour):** ask a question *by voice* and the answer plays while the
+page **auto-scrolls** to the sections it discusses and the **3D globe rotates** to the country
+it names — all from the deterministic numbers (the LLM only narrates).
 
 ---
 
 ## Other commands
 
 ```bash
-uv run pytest -q                              # 270 offline tests, all green
+uv run pytest -q                              # 299 offline tests, all green
 uv run python -m gas_agent.decision_backtest  # gas backtest verdict (policy vs 0/50/100% + random + shocked)
 uv run python -m ceramics_agent.backtest      # ceramics backtest verdict (agent vs random/cheap/top-ranked + 24-mo)
+uv run python scripts/build_scenarios.py --seed   # seed the scenario library offline (no key)
+uv run python scripts/build_scenarios.py          # build the full live scenario grid (needs key; ~11 min/cell)
 uv run python scripts/build_voiceover.py      # regenerate narration clips
 ```
 

@@ -18,6 +18,10 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 CACHE_DIR = PROJECT_ROOT / "cache"
+# Committed, read-only library of pre-fetched real Sybilion scenarios (W17). Each
+# scenario dir mirrors a cache job dir; the artifact loaders read cache first, then
+# here, so a matched scenario flows through the existing render path unchanged.
+SCENARIOS_DIR = PROJECT_ROOT / "scenarios"
 
 # Sybilion forecasting API
 SYBILION_API_KEY = os.getenv("SYBILION_API_KEY", "")
@@ -79,10 +83,19 @@ LOCAL_TTS_VOICE = os.getenv("LOCAL_TTS_VOICE", "")
 ASR_PROVIDER = os.getenv("ASR_PROVIDER", "auto").lower()
 NVIDIA_ASR_FUNCTION_ID = os.getenv("NVIDIA_ASR_FUNCTION_ID", "")
 
+# Local Whisper (faster-whisper) — the offline, no-cloud-key ASR fallback. Optional
+# dependency (`uv sync --extra localasr`); when installed it joins the "auto" ladder
+# after the cloud backends, so voice input works even with no/broken cloud keys. The
+# model downloads once (~145 MB for "base") then runs on CPU (~1-3s per short clip).
+LOCAL_ASR_MODEL = os.getenv("LOCAL_ASR_MODEL", "base")
+
 # HuggingFace Inference API (text-only models over plain HTTPS via httpx — no new
 # hard dependency). Used for the Whisper ASR fallback when NVIDIA is unavailable.
 HF_API_KEY = os.getenv("HF_API_KEY", "")
-HF_BASE_URL = os.getenv("HF_BASE_URL", "https://api-inference.huggingface.co")
+# The legacy api-inference.huggingface.co host is RETIRED (NXDOMAIN). The serverless
+# Inference API now routes through router.huggingface.co/hf-inference. transcribe.py
+# rewrites a stale legacy base to the router automatically, so an old .env still works.
+HF_BASE_URL = os.getenv("HF_BASE_URL", "https://router.huggingface.co")
 HF_ASR_MODEL = os.getenv("HF_ASR_MODEL", "openai/whisper-large-v3")
 
 

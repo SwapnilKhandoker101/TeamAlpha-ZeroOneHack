@@ -10,15 +10,19 @@ derives, and a Featherless narrative explaining the decision it did not make.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from gas_agent import config
 from gas_agent import geo
+from gas_agent import scenarios as scenario_lib
 from gas_agent import sybilion_client as sc
+from gas_agent import tour
 from gas_agent import transcribe
 from gas_agent import voice
 from gas_agent import voice_chat
@@ -41,6 +45,7 @@ from ceramics_agent import forecast as cforecast
 from ceramics_agent import impact
 from ceramics_agent import intake
 from ceramics_agent import pipeline
+from ceramics_agent.catalog import get_product
 from ceramics_agent.cost_policy import CostWeights
 from ceramics_agent.scenario import affected_factors_for
 
@@ -163,6 +168,92 @@ def render_voiceover(text: str, cache_name: str, autoplay: bool = False) -> None
     voice_suffix = f" · {data['voice']}" if data.get("voice") else ""
     st.caption(f"🔊 Narrated by {data['provider']}{voice_suffix} — voicing the explanation "
                "above, not deciding it.")
+
+
+# --------------------------------------------------------------------------- #
+# Voice-guided tour (W16) — a spoken answer that scrolls the page + spins the globe
+# in sync. One components.html block whose JS drives the PARENT page (same-origin
+# localhost), with layered graceful degradation so it can never break the demo.
+# --------------------------------------------------------------------------- #
+def _anchor(slug: str) -> None:
+    """Place an invisible scroll target before a section heading (a tour beat lands here)."""
+    st.markdown(tour.anchor_html(slug), unsafe_allow_html=True)
+
+
+_TOUR_JS = """
+<div data-tour-nonce="__NONCE__" style="font:13px system-ui;color:#64748b;padding:2px 0">
+  <span id="fa-tour-status">🔊 Guided tour — the page follows the narration…</span>
+</div>
+<script>
+(function(){
+  const BEATS = __PAYLOAD__;
+  const P = window.parent;
+  let D = null; try { D = P.document; } catch (e) { D = null; }   // null ⇒ cross-origin ⇒ audio-only
+  const status = document.getElementById('fa-tour-status');
+  function anchor(slug){ try { return D && D.querySelector("[data-tour-anchor='"+slug+"']"); } catch(e){ return null; } }
+  function globe(){ try { return [...D.querySelectorAll('.js-plotly-plot')].find(d=>d._fullLayout&&d._fullLayout.geo); } catch(e){ return null; } }
+  function readMs(s){ return Math.max(1600, (s.length/14)*1000); }
+  function play(i){
+    const b = BEATS[i];
+    if(!b){ if(status) status.textContent='✓ Tour complete.'; return; }
+    if(D){
+      const a = anchor(b.anchor);
+      if(a && a.scrollIntoView){ try { a.scrollIntoView({behavior:'smooth', block:'center'}); } catch(e){} }
+      if(b.pose){ const g = globe();
+        if(g && P.Plotly){
+          const layout = {'geo.projection.rotation':{lon:b.pose.lon, lat:b.pose.lat}, 'geo.projection.scale':b.pose.scale};
+          try { P.Plotly.animate(g, {layout: layout}, {transition:{duration:900, easing:'cubic-in-out'}, frame:{duration:900}}); }
+          catch(e){ try { P.Plotly.relayout(g, layout); } catch(_){} }
+        }
+      }
+    }
+    const audio = b.audio_b64 ? new Audio('data:'+b.mime+';base64,'+b.audio_b64) : null;
+    if(audio){
+      audio.addEventListener('ended', function(){ play(i+1); }, {once:true});
+      audio.addEventListener('error', function(){ setTimeout(function(){ play(i+1); }, 1200); }, {once:true});
+      const pr = audio.play();
+      if(pr && pr.catch){ pr.catch(function(){ setTimeout(function(){ play(i+1); }, readMs(b.say)); }); }
+    } else {
+      setTimeout(function(){ play(i+1); }, readMs(b.say));
+    }
+  }
+  play(0);
+})();
+</script>
+"""
+
+
+def render_tour(beats: list[dict]) -> None:
+    """Play a voice-guided tour from ``beats`` (each: say / anchor / pose / audio_b64).
+
+    One ``components.html`` block: its JS scrolls the parent page to each beat's anchor,
+    rotates/zooms the globe to its pose, plays the beat's audio, and advances on the audio
+    ``ended`` event. Degrades: no parent access → audio-only; ``Plotly`` absent → scroll +
+    audio; autoplay blocked → estimated-read timer. The narration only voices already-decided
+    numbers (THE RULE). A per-tour nonce forces a fresh iframe mount so each tour replays."""
+    if not beats:
+        return
+    payload = json.dumps(beats).replace("</", "<\\/")  # safe to embed in <script>
+    nonce = hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+    html = _TOUR_JS.replace("__PAYLOAD__", payload).replace("__NONCE__", nonce)
+    components.html(html, height=38)
+
+
+def _stash_tour(prompt: str, answer_text: str, curation, *, route_kind: str | None = None) -> bool:
+    """Build + synthesise a guided tour for a chat answer and queue it for the next run
+    (mirrors the ``pending_voice`` pattern). Returns True when a tour was queued. The beats
+    are split from the EXISTING answer text and synthesised with the local voice — no LLM,
+    no number touched, no NVIDIA budget burned."""
+    if route_kind is None:
+        is_shock = parse_shock_request(prompt, use_llm=False).is_shock
+        route_kind = tour.route_kind_for(
+            prompt, is_shock=is_shock, is_about=voice_chat.is_about_question(prompt))
+    regions = [d.region for d in curation.kept if getattr(d, "region", "")]
+    beats = tour.synth_beats(tour.build_beats(route_kind, answer_text, regions=regions))
+    if not beats:
+        return False
+    st.session_state["pending_tour"] = [b.to_dict() for b in beats]
+    return True
 
 
 def price_band_figure(ttf: dict, forecast_json: dict, history_months: int = 30) -> go.Figure:
@@ -309,7 +400,7 @@ def globe_figure(countries) -> go.Figure:
             mode="markers", name="kept (credible)", hoverinfo="text",
             marker=dict(
                 size=[14 + 34 * (c.kept_importance / max_importance) for c in kept],
-                color=GREEN, opacity=0.85, line=dict(width=1, color="white")),
+                color=GREEN, opacity=0.9, line=dict(width=1, color="#475569")),
         ))
     if rejected:
         figure.add_trace(go.Scattergeo(
@@ -317,11 +408,11 @@ def globe_figure(countries) -> go.Figure:
             text=[f"{c.region} · {c.rejected_count} spurious dropped" for c in rejected],
             customdata=[c.region for c in rejected],
             mode="markers", name="dropped (spurious)", hoverinfo="text",
-            marker=dict(size=12, color=RED, opacity=0.9, line=dict(width=1, color="white")),
+            marker=dict(size=12, color=RED, opacity=0.9, line=dict(width=1, color="#475569")),
         ))
     figure.update_geos(
-        projection_type="orthographic", showland=True, landcolor="#1f2937",
-        showocean=True, oceancolor="#0b1220", showcountries=True, countrycolor="#374151",
+        projection_type="orthographic", showland=True, landcolor="#e2e8f0",
+        showocean=True, oceancolor="#eaf2fb", showcountries=True, countrycolor="#cbd5e1",
         showcoastlines=False, bgcolor="rgba(0,0,0,0)",
         projection_rotation=dict(lon=20, lat=30),
     )
@@ -505,12 +596,16 @@ def _route_chat_message(prompt: str, months, spot, curation, use_llm: bool,
 
 def _handle_voice_prompt(text: str, months, spot, curation, use_llm: bool,
                          freeform: bool) -> None:
-    """Transcribed question → same routing as a typed message, then speak the reply
-    after the rerun (so the new transcript shows in the chat log first)."""
+    """Transcribed question → same routing as a typed message, then play a VOICE-GUIDED
+    TOUR after the rerun: the answer narrates while the page scrolls to the sections it
+    discusses and the globe rotates to the country it names (W16). The recording is the
+    user gesture that lets the tour autoplay. Falls back to a single spoken clip if no
+    tour could be built."""
     st.session_state.messages.append({"role": "user", "content": f"🎤 {text}"})
     reply, spoken = _route_chat_message(text, months, spot, curation, use_llm, freeform)
     st.session_state.messages.append({"role": "assistant", "content": reply})
-    st.session_state.pending_voice = spoken
+    if not _stash_tour(text, spoken or reply, curation):
+        st.session_state.pending_voice = spoken  # nothing to tour → the old single clip
     st.rerun()
 
 
@@ -532,19 +627,65 @@ def _run_gas_live_forecast(persona: str) -> str:
 
 
 def _resolve_gas_job() -> str | None:
-    """The gas forecast job in force: the session-only live job when the Live toggle is
-    on, else the pinned cached demo job (``None`` when nothing is cached). ``latest_job.txt``
-    is never repointed, so flipping Live off restores the deterministic demo with no fetch."""
+    """The gas forecast job in force, in priority order: a session-only **live** job when
+    the Live toggle is on → the matched **scenario** slug from the committed library (W17)
+    → the pinned cached demo job. ``latest_job.txt`` is never repointed, so flipping Live
+    off (or changing the description) restores the right cached/library forecast with no fetch."""
     live_on = st.session_state.get("live_mode_on", False)
     live_job = st.session_state.get("live_gas_job")
-    return live_job if (live_on and live_job) else sc.get_latest_job()
+    if live_on and live_job:
+        return live_job
+    scenario_slug = st.session_state.get("scenario_gas_slug")
+    if scenario_slug:
+        return scenario_slug
+    return sc.get_latest_job()
 
 
 def _resolve_ceramics_job() -> str | None:
-    """The ceramics forecast job in force: a live ceramics job when Live is on, else
-    ``None`` → the committed mock (the offline demo source)."""
+    """The ceramics forecast job in force: a **live** ceramics job when Live is on → the
+    matched scenario's shared 4-factor ref (W17) → ``None`` (the committed mock). The
+    artifact loader resolves a scenario ref out of ``scenarios/`` transparently."""
     live_on = st.session_state.get("live_mode_on", False)
-    return st.session_state.get("live_cer_job") if live_on else None
+    if live_on and st.session_state.get("live_cer_job"):
+        return st.session_state["live_cer_job"]
+    return st.session_state.get("scenario_cer_ref")  # None → load_ceramics_forecast uses the mock
+
+
+def _resolve_scenario(profile: intake.CompanyProfile) -> None:
+    """Match the profile to the nearest committed library scenario (W17) and stash the
+    job refs both sections resolve through. A forecast depends only on (product,
+    gas_exposure), so the match is an exact lookup on those two (nearest-fallback while
+    the library is still being populated). Empty library → clear refs (→ cached gas + mock)."""
+    match = scenario_lib.match(profile.product_id, profile.gas_exposure)
+    if match is None:
+        st.session_state.pop("scenario_gas_slug", None)
+        st.session_state.pop("scenario_cer_ref", None)
+        st.session_state["scenario_match"] = None
+        return
+    st.session_state["scenario_gas_slug"] = match.scenario.slug
+    st.session_state["scenario_cer_ref"] = match.scenario.ceramics_ref
+    st.session_state["scenario_match"] = {"label": match.scenario.label, "exact": match.exact}
+
+
+def _render_scenario_banner(profile: intake.CompanyProfile) -> None:
+    """Tell the user their description was served from the pre-fetched library (instant,
+    real Sybilion data) — or, when there's no exact cell yet, that it's the nearest ready
+    one with a hint to run live. Hidden when Live mode is on (live overrides the library)."""
+    match = st.session_state.get("scenario_match")
+    if not match or st.session_state.get("live_mode_on"):
+        return
+    if match["exact"]:
+        st.success(
+            f"📚 **Served instantly from the scenario library** — a real pre-fetched Sybilion "
+            f"forecast for **{match['label']}**, matched to your description (no ~11-min live wait)."
+        )
+    else:
+        ready = ", ".join(s.label for s in scenario_lib.nearest_options(profile.product_id)) or "—"
+        st.info(
+            f"📚 No exact cached scenario for **{profile.product_name} · {profile.gas_exposure}-gas** "
+            f"yet — showing the **nearest ready** one (**{match['label']}**). Ready now: {ready}. "
+            "Turn on **Live Sybilion forecast** above to fetch yours fresh (~11 min)."
+        )
 
 
 def _current_ceramics_weights(profile: intake.CompanyProfile) -> CostWeights:
@@ -662,13 +803,13 @@ def render_chat_panel() -> None:
                           help=f"Fires the canonical full-severity shock: '{SHOCK_BUTTON_MESSAGE}'."):
         affected = affected_factors_for(SHOCK_BUTTON_MESSAGE)
         _set_shock(1.0, "Strait of Hormuz disruption", affected)
+        reply = _combined_shock_reply(
+            SHOCK_BUTTON_MESSAGE, months, spot, curation, 1.0,
+            "Strait of Hormuz disruption", affected)
         st.session_state.messages.append({"role": "user", "content": SHOCK_BUTTON_MESSAGE})
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": _combined_shock_reply(
-                SHOCK_BUTTON_MESSAGE, months, spot, curation, 1.0,
-                "Strait of Hormuz disruption", affected),
-        })
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        # The button click is a gesture → drive a guided tour of the shocked decision.
+        _stash_tour(SHOCK_BUTTON_MESSAGE, reply, curation, route_kind="shock")
         st.rerun()
     if controls[1].button("Reset to calm", use_container_width=True, disabled=not active):
         _set_shock(0.0, "")
@@ -688,11 +829,16 @@ def render_chat_panel() -> None:
     for message in st.session_state.messages:
         log.chat_message(message["role"]).write(message["content"])
 
-    # Speak the most recent voice answer (queued on the prior run so the transcript
-    # renders first). Popped after playing so it never loops.
-    pending = st.session_state.pop("pending_voice", "")
-    if pending:
-        render_voiceover(pending, "chat", autoplay=True)
+    # Play the most recent answer (queued on the prior run so the transcript renders
+    # first). A voice-guided tour takes precedence (scroll + globe + chained audio, W16);
+    # otherwise the single spoken clip. Popped after playing so neither ever loops.
+    tour_beats = st.session_state.pop("pending_tour", None)
+    if tour_beats:
+        render_tour(tour_beats)
+    else:
+        pending = st.session_state.pop("pending_voice", "")
+        if pending:
+            render_voiceover(pending, "chat", autoplay=True)
 
     # Push-to-talk: record a question, transcribe it, then route it through the SAME
     # branches a typed message hits. Hidden when no ASR backend is wired up, so the text
@@ -714,7 +860,8 @@ def render_chat_panel() -> None:
                 if heard:
                     _handle_voice_prompt(heard, months, spot, curation, use_llm, freeform)
                 else:
-                    st.warning("Couldn't transcribe that clip — try again or type your question.")
+                    st.warning(f"Couldn't transcribe that clip — {transcribe.last_error()}. "
+                               "Try again, or type your question.")
     else:
         st.caption("🎤 Voice input: add `HF_API_KEY` or `NVIDIA_ASR_FUNCTION_ID` to ask by voice.")
 
@@ -727,18 +874,16 @@ def render_chat_panel() -> None:
 
 
 def render_gas_section(persona: str) -> None:
+    _anchor("gas")
     st.header("① Should we lock in gas forward?")
     st.caption("How much of next quarter's gas should an energy-intensive EU buyer "
                "lock in forward now, versus leave to spot? A decision built on the "
                "Sybilion forecast's confidence band — not its point estimate.")
 
-    # Job resolution: the pinned demo job by default. The unified top-of-page
-    # Live⟷Cached toggle swaps in a freshly-fetched, session-only job — latest_job.txt
-    # stays pinned, so toggling back to Cached instantly restores the deterministic
-    # demo numbers with no re-fetch.
-    live_on = st.session_state.get("live_mode_on", False)
-    live_job = st.session_state.get("live_gas_job")
-    job_id = live_job if (live_on and live_job) else sc.get_latest_job()
+    # Job resolution (single source of truth): a live job, else the matched library
+    # scenario, else the pinned cached demo — see _resolve_gas_job. latest_job.txt stays
+    # pinned, so toggling Live off or changing the description restores instantly.
+    job_id = _resolve_gas_job()
     if not job_id:
         st.error("No cached forecast found. Run a forecast first.")
         return
@@ -821,6 +966,7 @@ def render_gas_section(persona: str) -> None:
         st.markdown("**Keywords:** " + " · ".join(f"`{k}`" for k in selection.keywords))
         st.caption(f"recency factor {selection.recency_factor:.2f} — higher leans on recent data.")
 
+    _anchor("hedge")
     left, right = st.columns(2)
     with left:
         st.subheader("Probabilistic price forecast")
@@ -829,6 +975,7 @@ def render_gas_section(persona: str) -> None:
         st.subheader("The decision — hedge ratio per month")
         st.plotly_chart(hedge_ratio_figure(decisions), use_container_width=True)
 
+    _anchor("backtest")
     st.subheader("Did the decision beat the naive baselines?")
     backtest = cached_backtest(job_id)
     bt_chart, bt_stats = st.columns([3, 2])
@@ -854,6 +1001,7 @@ def render_gas_section(persona: str) -> None:
         shocked_bt = cached_backtest(job_id, shock_magnitude=round(magnitude, 4))
         st.info("🛡️ **Backtest under the active shock** — " + shocked_bt.shock_verdict)
 
+    _anchor("why")
     st.subheader("Why — the agent's explanation")
     if shock_active:
         explanation = cached_shock_explanation(
@@ -885,6 +1033,7 @@ def render_gas_section(persona: str) -> None:
         } for d in curation.rejected])
         st.dataframe(rejected_table, use_container_width=True, hide_index=True, height=240)
 
+    _anchor("drivers_globe")
     st.subheader("Where the drivers live — the agent's world view")
     st.caption("Green markers are the suppliers and hubs the agent trusts (bigger = more "
                "kept importance); red markers are countries that only surfaced through "
@@ -954,10 +1103,10 @@ _HERO_EXAMPLES: tuple[tuple[str, str], ...] = (
 )
 
 
-# Centralised CSS polish (W8). Built on the .streamlit/config.toml palette. Targets
-# stable Streamlit testids / structural classes only, and every rule is a gentle
-# enhancement (spacing, borders, weight) — never a layout-breaking override — so it
-# degrades safely across Streamlit versions and never blocks the demo.
+# Centralised CSS polish (W13 — light theme). Built on the .streamlit/config.toml
+# palette. Targets stable Streamlit testids / structural classes only, and every rule
+# is a gentle enhancement (spacing, borders, weight) — never a layout-breaking override
+# — so it degrades safely across Streamlit versions and never blocks the demo.
 _GLOBAL_CSS = """
 <style>
   /* Breathing room + a comfortable reading width for the stacked single page. */
@@ -966,26 +1115,26 @@ _GLOBAL_CSS = """
   /* Hero. */
   .fa-hero h1 { font-size: 2.5rem; font-weight: 800; letter-spacing: -0.02em; margin: 0; line-height: 1.1; }
   .fa-hero .fa-accent {
-    background: linear-gradient(90deg, #22c55e 0%, #38bdf8 100%);
+    background: linear-gradient(90deg, #16a34a 0%, #2563eb 100%);
     -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
   }
-  .fa-hero p { color: #9aa7bd; font-size: 1.08rem; margin-top: .5rem; max-width: 62rem; line-height: 1.55; }
+  .fa-hero p { color: #475569; font-size: 1.08rem; margin-top: .5rem; max-width: 62rem; line-height: 1.55; }
   .fa-pill {
     display: inline-block; margin-top: .9rem; padding: .28rem .7rem; border-radius: 999px;
-    font-size: .8rem; font-weight: 600; color: #bbf7d0;
-    background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.35);
+    font-size: .8rem; font-weight: 600; color: #166534;
+    background: rgba(22,163,74,.10); border: 1px solid rgba(22,163,74,.30);
   }
 
   /* Section headers (the ① / ② decision headers) get an accent rule. */
   [data-testid="stHeading"] h2 {
-    border-left: 4px solid #22c55e; padding-left: .6rem; margin-top: .4rem;
+    border-left: 4px solid #16a34a; padding-left: .6rem; margin-top: .4rem;
     font-weight: 750; letter-spacing: -0.01em;
   }
 
-  /* Metrics as cards. */
+  /* Metrics as cards (light). */
   [data-testid="stMetric"] {
-    background: #111c33; border: 1px solid #1f2c47; border-radius: 12px;
-    padding: 14px 16px;
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px;
+    padding: 14px 16px; box-shadow: 0 1px 2px rgba(15,23,42,.04);
   }
   [data-testid="stMetricValue"] { font-weight: 750; }
 
@@ -996,8 +1145,8 @@ _GLOBAL_CSS = """
   .stButton > button { border-radius: 10px; font-weight: 600; }
   [data-testid="stChatInput"] textarea { border-radius: 10px; }
 
-  /* Tab-like radio (globe layer toggle) + segmented control read as pills. */
-  [data-testid="stCaptionContainer"] { color: #8a98ad; }
+  /* Captions a touch muted against the light surface. */
+  [data-testid="stCaptionContainer"] { color: #64748b; }
 </style>
 """
 
@@ -1029,10 +1178,57 @@ def _profile_signature(profile: intake.CompanyProfile) -> str:
     ])
 
 
+def _render_intake_voice() -> None:
+    """W14 — describe the business BY VOICE at the very start: a mic that transcribes
+    into the description box for review (reuses the same ASR ladder as the chat). Hidden
+    with no ASR key, so the text-only / no-keys intake is unchanged."""
+    if not transcribe.available():
+        return
+    clip = st.audio_input("🎤 Or describe it by voice", key="intake_voice")
+    if clip is None:
+        return
+    data = clip.getvalue()
+    signature = hashlib.md5(data).hexdigest() if data else ""
+    if signature and signature != st.session_state.get("intake_voice_sig"):
+        st.session_state["intake_voice_sig"] = signature
+        with st.spinner("Transcribing…"):
+            heard = transcribe.transcribe(data)
+        if heard:
+            st.session_state["intake_text"] = heard  # fills the box for review, then submit
+            st.rerun()
+        else:
+            st.warning(f"Couldn't transcribe that clip — {transcribe.last_error()}. "
+                       "Try again, or just type your description below.")
+
+
+def _render_intake_settings() -> None:
+    """W15 — settings available at the START: live forecast + the two chat classifiers,
+    using the SAME session_state keys the results-screen controls use (so they stay in
+    sync; the two screens never co-render, so there's no widget-key collision)."""
+    have_key = config.have_sybilion_key()
+    with st.expander("⚙️ Advanced — live forecast & chat behaviour (optional)"):
+        st.toggle(
+            "Live Sybilion forecast on submit", key="live_mode_on", disabled=not have_key,
+            help="OFF (default): instant — served from the committed scenario library / cache. "
+                 "ON: also fetch a FRESH live forecast on submit (~11 min; polls in the background, "
+                 "and falls back to the matched scenario if anything is unreachable).")
+        if not have_key:
+            st.caption("🔒 Add `SYBILION_API_KEY` to enable live forecasting.")
+        st.toggle(
+            "Let Featherless classify chat messages", key="use_llm_classify",
+            help="On: a small model reads a chat shock's severity + label (never a number). "
+                 "Off (default): deterministic keyword parse.")
+        st.toggle(
+            "Free-form re-forecast (re-pick Sybilion filters from a chat message)",
+            key="freeform_reforecast",
+            help="On: a non-shock chat message re-runs the keyword agent to re-pick filters. "
+                 "Off (default): guided supply-shock only.")
+
+
 def _render_hero_form() -> None:
-    """The opening intake: example chips + a free-text description box. On submit it
-    extracts a CompanyProfile (LLM extraction-only → deterministic fallback) and
-    queues the pipeline animation."""
+    """The opening intake: example chips + a free-text description box (typed or spoken)
+    + optional advanced settings. On submit it extracts a CompanyProfile (LLM
+    extraction-only → deterministic fallback) and queues the pipeline animation."""
     st.session_state.setdefault("intake_text", "")
     st.caption("Try an example, or describe your own business:")
     ex_cols = st.columns(len(_HERO_EXAMPLES))
@@ -1040,6 +1236,8 @@ def _render_hero_form() -> None:
         if col.button(label, use_container_width=True):
             st.session_state["intake_text"] = text
             st.rerun()
+
+    _render_intake_voice()
 
     with st.form("intake_form"):
         st.text_area(
@@ -1055,14 +1253,23 @@ def _render_hero_form() -> None:
 
     st.caption("Leave it blank and submit to run the committed demo base case "
                "(5,000 handmade bowls). No keys needed.")
+    _render_intake_settings()
 
     if submitted:
         text = st.session_state.get("intake_text", "").strip()
-        profile, missing = intake.parse_description(text)
+        # Immediate feedback — the LLM extraction can take a couple of seconds, so show
+        # that the click registered (request: "I didn't know if it was working").
+        with st.spinner("🧠 Reading your business and picking the forecast drivers…"):
+            profile, missing = intake.parse_description(text)
         st.session_state["profile"] = profile
         st.session_state["missing"] = missing
         st.session_state["profile_version"] = st.session_state.get("profile_version", 0) + 1
         st.session_state["run_pipeline"] = True
+        # If the user opted into live at intake (and has a key), auto-start the live run on
+        # the results screen — "they wanted live, so do it" — while the matched scenario
+        # renders instantly in the meantime (W15 × W17 × W18).
+        if st.session_state.get("live_mode_on") and config.have_sybilion_key():
+            st.session_state["live_autostart"] = True
         # Only pause for clarifiers when the user wrote something we couldn't fully parse;
         # a blank submit means "just run the demo defaults", so skip straight to results.
         questions = intake.follow_up_questions(missing) if text else []
@@ -1070,27 +1277,109 @@ def _render_hero_form() -> None:
         st.rerun()
 
 
+def _understood_summary(profile: intake.CompanyProfile, missing: list[str]) -> list[str]:
+    """The facts the description DID state (everything not in ``missing``) — shown back so
+    the user sees what was understood and isn't re-asked about it."""
+    m = set(missing)
+    bits: list[str] = []
+    if "product" not in m:
+        bits.append(f"**{profile.product_name}**")
+    if "quantity" not in m:
+        bits.append(f"{profile.quantity:,} units")
+    if "timeline_days" not in m:
+        bits.append(f"{profile.timeline_days}-day run")
+    if "competition" not in m:
+        bits.append(f"{profile.competition} competition")
+    if "gas_exposure" not in m:
+        bits.append(f"{profile.gas_exposure} gas exposure")
+    if "sell_regions" not in m and profile.sell_regions:
+        bits.append(f"sells into {', '.join(profile.sell_regions)}")
+    return bits
+
+
+def _render_followup_voice(profile: intake.CompanyProfile) -> None:
+    """Answer the clarifiers BY VOICE: transcribe a spoken add-on, fold it into the
+    description, and re-read the WHOLE thing — so speaking the missing bits fills them in
+    (and usually clears the questions) rather than answering one box at a time."""
+    if not transcribe.available():
+        return
+    clip = st.audio_input("🎤 Or just say the missing details — I'll re-read everything",
+                          key="followup_voice")
+    if clip is None:
+        return
+    data = clip.getvalue()
+    signature = hashlib.md5(data).hexdigest() if data else ""
+    if signature and signature != st.session_state.get("followup_voice_sig"):
+        st.session_state["followup_voice_sig"] = signature
+        with st.spinner("Transcribing…"):
+            heard = transcribe.transcribe(data)
+        if not heard:
+            st.warning(f"Couldn't transcribe that — {transcribe.last_error()}. Use the fields below.")
+            return
+        combined = f"{profile.description}. {heard}".strip(". ").strip() or heard
+        with st.spinner("🧠 Re-reading your business…"):
+            new_profile, missing = intake.parse_description(combined)
+        st.session_state["profile"] = new_profile
+        st.session_state["missing"] = missing
+        st.session_state["awaiting_followups"] = bool(intake.follow_up_questions(missing))
+        st.rerun()
+
+
+def _missing_field_widget(field_name: str, label: str, profile: intake.CompanyProfile):
+    """A typed input for one missing field, PRE-FILLED with the sensible default so the
+    user only has to confirm or nudge it (never retype what was already understood)."""
+    key = f"fu_{field_name}"
+    if field_name == "product":
+        ids = list(intake.VALID_PRODUCT_IDS)
+        return st.selectbox(label, ids, index=ids.index(profile.product_id),
+                            format_func=lambda p: get_product(p).name, key=key)
+    if field_name == "quantity":
+        return st.number_input(label, min_value=100, max_value=50_000,
+                               value=int(profile.quantity), step=100, key=key)
+    if field_name == "timeline_days":
+        return st.slider(label, 5, 60, int(profile.timeline_days), key=key)
+    if field_name == "competition":
+        opts = list(intake.VALID_COMPETITION)
+        return st.selectbox(label, opts, index=opts.index(profile.competition), key=key)
+    if field_name == "gas_exposure":
+        opts = list(intake.VALID_GAS_EXPOSURE)
+        return st.selectbox(label, opts, index=opts.index(profile.gas_exposure), key=key)
+    if field_name == "sell_regions":
+        return st.text_input(label, value=", ".join(profile.sell_regions),
+                             placeholder="e.g. Germany, France", key=key)
+    return st.text_input(label, key=key)
+
+
 def _render_followups() -> None:
-    """Ask 1-3 plain clarifiers for the fields the description didn't state. Skippable —
-    the profile is already complete with committed defaults, so this only refines it."""
+    """Confirm what was understood and ask ONLY the fields the description didn't state —
+    each pre-filled with a sensible default. Skippable (the profile is already complete).
+    Answerable by voice (re-reads the whole description) or by the typed fields."""
     profile: intake.CompanyProfile = st.session_state["profile"]
-    questions = intake.follow_up_questions(st.session_state.get("missing", []))
-    st.info("A few quick clarifiers so the forecast fits your business — or skip and I'll "
-            "use sensible defaults.")
+    missing = st.session_state.get("missing", [])
+
+    understood = _understood_summary(profile, missing)
+    if understood:
+        st.success("✓ Understood from your description: " + " · ".join(understood))
+    st.info("Just confirm the few details you didn't mention — pre-filled with sensible "
+            "defaults, so you can change only what matters (or skip and I'll use them as-is).")
+
+    _render_followup_voice(profile)
+
+    # Mirror follow_up_questions' priority order + 3-question cap, but render typed widgets.
+    questions = intake.follow_up_questions(missing)
+    field_labels = [(intake.missing_field_for_question(q), q) for q in questions]
     with st.form("followups_form"):
-        typed: dict[str, str] = {}
-        for question in questions:
-            field_name = intake.missing_field_for_question(question)
+        chosen: dict[str, object] = {}
+        for field_name, label in field_labels:
             if field_name:
-                typed[field_name] = st.text_input(question, key=f"fu_{field_name}")
+                chosen[field_name] = _missing_field_widget(field_name, label, profile)
         cols = st.columns(2)
         cont = cols[0].form_submit_button("Continue", type="primary", use_container_width=True)
         skip = cols[1].form_submit_button("Skip — use defaults", use_container_width=True)
     if cont or skip:
         if cont:
-            for field_name, answer in typed.items():
-                if answer and answer.strip():
-                    profile = intake.apply_answer(profile, field_name, answer)
+            for field_name, value in chosen.items():
+                profile = intake.apply_answer(profile, field_name, str(value))
             st.session_state["profile"] = profile
         st.session_state["awaiting_followups"] = False
         st.rerun()
@@ -1119,8 +1408,9 @@ def _render_profile_summary(profile: intake.CompanyProfile) -> None:
             f"gas exposure {profile.gas_exposure}{regions}")
         if cols[1].button("↻ Start over", use_container_width=True):
             for key in ("profile", "missing", "awaiting_followups", "run_pipeline",
-                        "live_gas_job", "live_cer_job", "shock_magnitude", "shock_label",
-                        "messages"):
+                        "live_gas_job", "live_cer_job", "live_run", "shock_magnitude",
+                        "shock_label", "scenario_gas_slug", "scenario_cer_ref",
+                        "scenario_match", "messages"):
                 st.session_state.pop(key, None)
             st.rerun()
         source_note = {"llm": "Featherless extracted these facts from your description",
@@ -1130,28 +1420,133 @@ def _render_profile_summary(profile: intake.CompanyProfile) -> None:
                    "only extracts stated facts, it never invents an input or a number.")
 
 
+# --------------------------------------------------------------------------- #
+# Non-blocking live forecast (W18) — a real Sybilion job can take ~11 minutes, so a
+# blocking poll would freeze Streamlit and trip its timeouts. Instead we submit all
+# five jobs (gas + 4 ceramics factors) up front so they run in PARALLEL server-side,
+# then poll one tick per rerun inside an `st.fragment(run_every=…)` — only the status
+# box re-runs, never the whole app. On completion we fetch+cache artifacts, set the
+# session live jobs, and do one full rerun to render the live numbers. Per-agent
+# fallback keeps the cached/library demo whenever a job fails or times out.
+# --------------------------------------------------------------------------- #
+LIVE_TICK_SECONDS = 4.0
+LIVE_MAX_TICKS = 230  # ~15 minutes at 4s/tick — generous headroom over the ~11 min jobs
+
+
+def _gas_live_payload(persona: str) -> dict:
+    """Build the gas (TTF) Sybilion request body for a persona (submit-only; no poll)."""
+    selection = select_filters(persona)
+    ttf = sc.load_ttf_series()
+    return sc.build_forecast_payload(
+        ttf["timeseries"],
+        title=ttf.get("meta", {}).get("title") or sc.DEFAULT_SERIES_TITLE,
+        keywords=selection.keywords,
+        category_ids=selection.category_ids,
+        region_codes=selection.region_codes,
+    )
+
+
+def _advance_live_run(run: dict, client: sc.SybilionClient, profile: intake.CompanyProfile) -> dict:
+    """One non-blocking step of the live run state machine. Talks to Sybilion only via
+    the split submit/poll/fetch helpers — never blocks. Mutates and returns ``run``."""
+    try:
+        if run["phase"] == "submit":
+            run["gas_job"] = sc.job_id_of(client.submit_forecast(_gas_live_payload(profile.persona())))
+            run["factor_jobs"] = cforecast.submit_factor_jobs(client, cforecast.default_factor_history())
+            run["phase"] = "poll"
+        elif run["phase"] == "poll":
+            run["ticks"] += 1
+            jobs = [run["gas_job"], *run["factor_jobs"].values()]
+            for job in jobs:
+                if job and not sc.is_terminal(run["statuses"].get(job, "")):
+                    run["statuses"][job] = sc.poll_once(client, job)
+            pending = [j for j in jobs if j and not sc.is_terminal(run["statuses"].get(j, ""))]
+            if not pending:
+                run["phase"] = "assemble"
+            elif run["ticks"] >= LIVE_MAX_TICKS:
+                run["phase"], run["error"] = "error", "timed out after ~15 minutes"
+        elif run["phase"] == "assemble":
+            gas = run["gas_job"]
+            if gas and run["statuses"].get(gas) == "completed":
+                sc.fetch_forecast_artifacts(client, gas)
+                st.session_state["live_gas_job"] = gas  # else: keep the cached/library gas
+            ok_factors = {f: j for f, j in run["factor_jobs"].items()
+                          if run["statuses"].get(j) == "completed"}
+            if len(ok_factors) == len(cforecast.FACTORS):  # all 4 or fall back whole ceramics to mock
+                for job in ok_factors.values():
+                    sc.fetch_forecast_artifacts(client, job)
+                st.session_state["live_cer_job"] = cforecast.assemble_ceramics_from_jobs(
+                    ok_factors, job_id=cforecast.combined_job_id(_profile_signature(profile)))
+            run["phase"] = "done"
+    except Exception as exc:  # noqa: BLE001 — surface and keep the cached/library demo
+        run["phase"], run["error"] = "error", str(exc)
+    return run
+
+
+def _render_live_progress(run: dict) -> None:
+    """The live-run status box (rendered every tick). Shows per-job progress + Cancel."""
+    if run["phase"] == "error":
+        st.warning(f"⚠️ Live forecast unreachable — {run['error']}. Showing the cached / "
+                   "library demo (every decision number is identical offline).")
+        if st.button("Dismiss", key="live_dismiss"):
+            st.session_state.pop("live_run", None)
+            st.rerun()
+        return
+
+    def mark(job: str | None) -> str:
+        status = run["statuses"].get(job, "") if job else ""
+        return {"completed": "✓", "failed": "✗"}.get(status, "…")
+
+    factors = " · ".join(f"{f} {mark(j)}" for f, j in run.get("factor_jobs", {}).items()) or "queuing…"
+    st.info(f"⏳ Forecasting live against today's market — a real Sybilion job can take ~11 min "
+            f"(polling every {int(LIVE_TICK_SECONDS)}s, runs in the background). "
+            f"gas {mark(run.get('gas_job'))} · {factors}")
+    if st.button("Cancel", key="live_cancel"):
+        st.session_state.pop("live_run", None)
+        st.rerun()
+
+
+@st.fragment(run_every=LIVE_TICK_SECONDS)
+def _live_run_fragment(profile: intake.CompanyProfile) -> None:
+    """Polls the live run one tick per ``run_every`` WITHOUT re-running the whole app."""
+    run = st.session_state.get("live_run")
+    if not run:
+        return
+    if run["phase"] not in ("done", "error"):
+        run = _advance_live_run(run, sc.SybilionClient(), profile)
+        st.session_state["live_run"] = run
+    _render_live_progress(run)
+    if run["phase"] == "done":
+        st.session_state.pop("live_run", None)
+        st.rerun()  # full rerun → both sections re-render on the live numbers
+
+
 def _render_live_refresh(profile: intake.CompanyProfile) -> None:
-    """The unified live refresh: one button forecasts BOTH the gas band and the four
-    ceramics factor bands live, caching each (latest_job.txt is never repointed, so
-    flipping back to Cached restores the deterministic demo)."""
-    gas_job = st.session_state.get("live_gas_job")
-    cer_job = st.session_state.get("live_cer_job")
+    """The unified live refresh: one button submits BOTH the gas band and the four
+    ceramics factor bands live, then polls them non-blocking across reruns (W18).
+    ``latest_job.txt`` is never repointed, so flipping back to Cached restores the demo."""
+    # Auto-start when the user opted into live at intake (W15) — fire the run once.
+    if (st.session_state.pop("live_autostart", False)
+            and not st.session_state.get("live_run")
+            and not st.session_state.get("live_gas_job")):
+        st.session_state["live_run"] = {
+            "phase": "submit", "gas_job": None, "factor_jobs": {},
+            "statuses": {}, "ticks": 0, "error": "",
+        }
+    if st.session_state.get("live_run"):
+        _live_run_fragment(profile)  # active run → poll across reruns, no app freeze
+        return
     if st.button("🔄 Run live forecast now", use_container_width=True,
                  help="Submit fresh forecasts to Sybilion (gas + 4 ceramics factors) for "
-                      "today's market. ~1-4 min; cached for the session."):
-        try:
-            with st.status("Forecasting live against today's market…", expanded=True) as status:
-                st.write("Submitting the gas (TTF) band to Sybilion…")
-                st.session_state["live_gas_job"] = _run_gas_live_forecast(profile.persona())
-                st.write("Submitting the four ceramics factor bands (gas / clay / power / freight)…")
-                st.session_state["live_cer_job"] = cforecast.ensure_ceramics_forecast(
-                    sc.SybilionClient(), cforecast.default_factor_history(),
-                    signature=_profile_signature(profile))
-                status.update(label="Live forecast cached — the numbers below are live.",
-                              state="complete", expanded=False)
-            st.rerun()
-        except Exception as exc:  # noqa: BLE001 — surface and keep the cached demo
-            st.error(f"Live refresh failed: {exc}. Showing the cached forecast.")
+                      "today's market. A real job can take ~11 min; it polls in the background "
+                      "and falls back to the cached demo if anything is unreachable."):
+        st.session_state["live_run"] = {
+            "phase": "submit", "gas_job": None, "factor_jobs": {},
+            "statuses": {}, "ticks": 0, "error": "",
+        }
+        st.rerun()
+    gas_job = st.session_state.get("live_gas_job")
+    cer_job = st.session_state.get("live_cer_job")
     if gas_job or cer_job:
         st.success(
             f"Live forecast active — gas `{(gas_job or '—')[:10]}…`, "
@@ -1220,8 +1615,13 @@ def main() -> None:
     # ceramics decision is actually on screen this run.
     st.session_state.pop("_cer_chat", None)
 
+    # Match the profile to the nearest committed library scenario (W17) — instant, real
+    # Sybilion data — before resolving the forecast jobs below.
+    _resolve_scenario(profile)
+
     _render_profile_summary(profile)
     focus = render_top_controls(profile)
+    _render_scenario_banner(profile)
 
     if st.session_state.pop("run_pipeline", False):
         _play_pipeline_animation(profile)
@@ -1236,9 +1636,7 @@ def main() -> None:
     if focus in ("Both", "Ceramics only"):
         from ceramics_agent.dashboard import render_ceramics_tab
 
-        live_on = st.session_state.get("live_mode_on", False)
-        cer_job = st.session_state.get("live_cer_job") if live_on else None
-        render_ceramics_tab(render_voiceover, profile=profile, job_id=cer_job)
+        render_ceramics_tab(render_voiceover, profile=profile, job_id=_resolve_ceramics_job())
 
     # One shared chat for both decisions, full-width at the page bottom.
     render_chat_panel()

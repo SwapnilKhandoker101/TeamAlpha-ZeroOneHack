@@ -237,44 +237,53 @@ def ensure_ceramics_forecast(
     )
 
 
-def run_live_ceramics_forecast(
+def factor_payload(factor: str, series: dict, *, soft_horizon: int = 6) -> dict:
+    """The Sybilion request body for one cost factor (reuses the gas payload builder)."""
+    meta = FACTOR_REQUEST_META[factor]
+    return sc.build_forecast_payload(
+        series,
+        title=meta["title"],
+        keywords=meta["keywords"],
+        category_ids=meta["category_ids"],
+        region_codes=meta["region_codes"],
+        soft_horizon=soft_horizon,
+    )
+
+
+def submit_factor_jobs(
     client: sc.SybilionClient,
     base_series_by_factor: dict[str, dict],
     *,
-    job_id: str | None = None,
     soft_horizon: int = 6,
-) -> str:
-    """Forecast all four factors live and cache one combined ``ceramics_forecast.json``.
-
-    For each factor it builds a Sybilion payload (reusing the gas agent's
-    :func:`~gas_agent.sybilion_client.build_forecast_payload`) from that factor's
-    historical ``{month: price}`` series in ``base_series_by_factor`` and runs the
-    same submit→poll→cache loop (:func:`~gas_agent.sybilion_client.run_live_forecast`).
-    The four per-factor forecasts are then assembled into a single artifact under a
-    combined job dir (``job_id`` when given — the cache-first deterministic id —
-    else a fresh random one).
-
-    Non-destructive by design (mirrors the gas live refresh): it caches under
-    ``cache/<combined_job>/`` and **never** calls ``set_latest_job``, so toggling
-    live off instantly restores the committed mock. Returns the combined job id.
-    """
-    factors_block: dict[str, dict] = {}
-    drivers_block: dict[str, list] = {}
-
+) -> dict[str, str]:
+    """Submit all four factor forecasts **up front** (non-blocking) and return
+    ``{factor: job_id}``. The caller (the app's W18 live run) then polls them in
+    parallel and calls :func:`assemble_ceramics_from_jobs` once all are terminal —
+    turning four sequential ~11-min waits into one parallel one."""
+    jobs: dict[str, str] = {}
     for factor in FACTORS:
         series = base_series_by_factor.get(factor)
         if not series:
             continue
-        meta = FACTOR_REQUEST_META[factor]
-        payload = sc.build_forecast_payload(
-            series,
-            title=meta["title"],
-            keywords=meta["keywords"],
-            category_ids=meta["category_ids"],
-            region_codes=meta["region_codes"],
-            soft_horizon=soft_horizon,
-        )
-        factor_job = sc.run_live_forecast(client, payload)
+        descriptor = client.submit_forecast(factor_payload(factor, series, soft_horizon=soft_horizon))
+        job = sc.job_id_of(descriptor)
+        if job:
+            jobs[factor] = job
+    return jobs
+
+
+def assemble_ceramics_from_jobs(
+    factor_jobs: dict[str, str],
+    *,
+    job_id: str | None = None,
+) -> str:
+    """Assemble the combined ``ceramics_forecast`` artifact from factor jobs whose
+    ``forecast.json`` (+ ``external_signals``) are already cached, and return the
+    combined job id. Non-destructive — caches under ``cache/<combined_job>/`` and
+    never calls ``set_latest_job``."""
+    factors_block: dict[str, dict] = {}
+    drivers_block: dict[str, list] = {}
+    for factor, factor_job in factor_jobs.items():
         forecast_json = sc.load_artifact(factor_job, "forecast.json")
         factors_block[factor] = {"forecast_series": forecast_json["data"]["forecast_series"]}
         drivers_block[factor] = _live_drivers_for(factor, factor_job)
@@ -287,6 +296,35 @@ def run_live_ceramics_forecast(
     }
     sc.save_artifact(combined_job, "ceramics_forecast", artifact)
     return combined_job
+
+
+def run_live_ceramics_forecast(
+    client: sc.SybilionClient,
+    base_series_by_factor: dict[str, dict],
+    *,
+    job_id: str | None = None,
+    soft_horizon: int = 6,
+) -> str:
+    """Forecast all four factors live and cache one combined ``ceramics_forecast.json``.
+
+    BLOCKING (used by the offline batch ``scripts/build_scenarios.py``): each factor
+    runs the submit→poll→cache loop (:func:`~gas_agent.sybilion_client.run_live_forecast`)
+    in turn, then the four are assembled via :func:`assemble_ceramics_from_jobs`. The
+    in-app live refresh instead uses :func:`submit_factor_jobs` + parallel polling (W18).
+
+    Non-destructive by design (mirrors the gas live refresh): it caches under
+    ``cache/<combined_job>/`` and **never** calls ``set_latest_job``, so toggling
+    live off instantly restores the committed mock. Returns the combined job id.
+    """
+    factor_jobs: dict[str, str] = {}
+    for factor in FACTORS:
+        series = base_series_by_factor.get(factor)
+        if not series:
+            continue
+        factor_jobs[factor] = sc.run_live_forecast(
+            client, factor_payload(factor, series, soft_horizon=soft_horizon)
+        )
+    return assemble_ceramics_from_jobs(factor_jobs, job_id=job_id)
 
 
 def _live_drivers_for(factor: str, factor_job: str) -> list[dict]:
