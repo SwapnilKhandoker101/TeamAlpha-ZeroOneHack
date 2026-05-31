@@ -37,20 +37,20 @@ _ANSWER = ("The agent locks 30% of next quarter forward. The confidence band is 
            "Norway is the strongest credible driver, with Russia close behind.")
 
 
-def test_why_walk_maps_sentences_onto_the_why_template():
+def test_tour_starts_at_the_chat_then_walks_the_template():
+    # Every tour begins at the chat (so the user sees the answer), then scrolls.
     beats = tour.build_beats("why", _ANSWER, regions=["Norway", "Russia"])
-    assert [b.anchor for b in beats] == [tour.WHY, tour.HEDGE, tour.DRIVERS_GLOBE]
-    # The last beat is a globe beat and gets a pose for a region named in the answer.
-    assert beats[-1].pose is not None
+    assert [b.anchor for b in beats] == [tour.CHAT, tour.WHY, tour.HEDGE]
+    assert beats[0].pose is None  # the chat beat never moves the globe
 
 
-def test_country_walk_is_all_globe_with_per_sentence_poses():
-    answer = "Norway supplies the most gas. Russia is the next biggest driver."
+def test_country_walk_rotates_the_globe_after_the_chat_intro():
+    answer = "Here is what I found. Norway supplies the most gas. Russia is next."
     beats = tour.build_beats("country", answer, regions=["Norway", "Russia"])
-    assert all(b.anchor == tour.DRIVERS_GLOBE for b in beats)
-    # Each sentence rotates the globe to the country IT names.
-    assert beats[0].pose == tour.pose_for("Norway")
-    assert beats[1].pose == tour.pose_for("Russia")
+    assert beats[0].anchor == tour.CHAT and beats[0].pose is None  # intro, no scroll
+    # The remaining beats are globe beats, each rotating to the country IT names.
+    assert beats[1].anchor == tour.DRIVERS_GLOBE and beats[1].pose == tour.pose_for("Norway")
+    assert beats[2].anchor == tour.DRIVERS_GLOBE and beats[2].pose == tour.pose_for("Russia")
 
 
 def test_beats_are_capped_and_deterministic():
@@ -85,7 +85,13 @@ def test_route_kind_classification():
     assert tour.route_kind_for("Iran closes Hormuz", is_shock=True, is_about=False) == "shock"
     assert tour.route_kind_for("what is this app?", is_shock=False, is_about=True) == "about"
     assert tour.route_kind_for("what about ceramics?", is_shock=False, is_about=False) == "ceramics"
-    assert tour.route_kind_for("which supplier matters?", is_shock=False, is_about=False) == "country"
+    # Supplier / lock / margin are CERAMICS-decision concepts → the ceramics section
+    # (the bug fix: these used to mis-route to the gas drivers globe).
+    assert tour.route_kind_for("which supplier matters?", is_shock=False, is_about=False) == "ceramics"
+    assert tour.route_kind_for("why this lock percentage?", is_shock=False, is_about=False) == "ceramics"
+    assert tour.route_kind_for("what's the margin?", is_shock=False, is_about=False) == "ceramics"
+    # Gas-driver / geography questions → the gas drivers globe.
+    assert tour.route_kind_for("which country drives gas?", is_shock=False, is_about=False) == "country"
     assert tour.route_kind_for("why this ratio?", is_shock=False, is_about=False) == "why"
 
 

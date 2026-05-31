@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from gas_agent import llm
 from gas_agent.config import KEYWORD_MODEL
 
-from ceramics_agent.catalog import PRODUCTS, get_product
+from ceramics_agent.catalog import PRODUCTS, Product, get_product
 from ceramics_agent.cost_policy import CostWeights, default_weights
 
 # Allowed enum values the rest of the pipeline understands.
@@ -360,6 +360,73 @@ def parse_description(text: str, *, use_llm: bool = True) -> tuple[CompanyProfil
         description=text,
         source="llm",
         notes=str(payload.get("notes", "")).strip(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Off-catalog product recognition (full-live mode) — LLM-estimated INPUT spec
+# --------------------------------------------------------------------------- #
+_PRODUCT_SPEC_SYSTEM = (
+    "You are a ceramics production engineer preparing physical INPUTS (not a decision, not a "
+    "price) for a costing agent. Read a manufacturer's description and identify the product. If "
+    "it clearly matches a catalog line, return its id; otherwise estimate a realistic per-unit "
+    "bill of materials for the NEW product so it can be costed.\n\n"
+    "Return ONLY a JSON object:\n"
+    '  "catalog_id": one of "bowl","dinnerware","tile" if it clearly matches, else null;\n'
+    '  "name": a short product name (e.g. "Ceramic Sink");\n'
+    '  "clay_kg": body clay kg per unit (>0);\n'
+    '  "glaze_kg": glaze kg per unit (>=0);\n'
+    '  "kiln_kwh": grid electricity kWh per unit (>0);\n'
+    '  "firing_gas_kwh": kiln gas kWh per unit (>0);\n'
+    '  "ship_kg": shipped weight kg per unit (>0).\n'
+    "Reference scale: a small bowl ~0.5kg clay / 6kWh gas; a 6-piece dinnerware set ~3kg / 22kWh; "
+    "a floor tile ~25kg / 120kWh; a large ceramic sink is heavier and more gas-intensive. These "
+    "are material estimates (inputs the user can edit), never a price or a decision."
+)
+
+
+def _spec_value(payload: dict, key: str, default: float, floor: float, ceiling: float) -> float:
+    """Coerce one estimated BOM number into a sane positive range (defends the cost math
+    against an absurd LLM value — the user can still edit it)."""
+    try:
+        value = float(payload.get(key))
+    except (TypeError, ValueError):
+        value = default
+    return max(floor, min(value, ceiling))
+
+
+def estimate_product(description: str, *, use_llm: bool = True) -> Product:
+    """Recognise the product in a description for FULL-LIVE mode.
+
+    Returns a committed catalog :class:`Product` when the description clearly matches one of
+    the three lines; otherwise an **LLM-estimated** custom Product (``estimated=True``) carrying a
+    per-unit bill of materials. THE RULE holds: the BOM is a *labeled, editable INPUT spec* (like
+    the user stating their materials), not a decision — the lock %, supplier and margin are still
+    computed deterministically from it downstream. The deterministic fallback (no key / failure)
+    is the nearest catalog product, so the offline path never invents a spec."""
+    text = (description or "").strip()
+    if not (text and use_llm and llm.featherless_available()):
+        return get_product(_product_from_text(text))  # offline → catalog only, never estimated
+    try:
+        payload = llm.chat_json(KEYWORD_MODEL, _PRODUCT_SPEC_SYSTEM, text, temperature=0.0, max_tokens=300)
+    except llm.LLMUnavailable:
+        return get_product(_product_from_text(text))
+    if not isinstance(payload, dict):
+        return get_product(_product_from_text(text))
+
+    catalog_id = _coerce_enum(payload.get("catalog_id"), VALID_PRODUCT_IDS)
+    if catalog_id:
+        return get_product(catalog_id)  # the LLM recognised a catalog product → use the real spec
+
+    name = str(payload.get("name") or "Custom ceramic product").strip()[:60] or "Custom ceramic product"
+    return Product(
+        id="custom", name=name,
+        clay_kg=_spec_value(payload, "clay_kg", 5.0, 0.1, 300.0),
+        glaze_kg=_spec_value(payload, "glaze_kg", 0.5, 0.0, 50.0),
+        kiln_kwh=_spec_value(payload, "kiln_kwh", 8.0, 0.1, 500.0),
+        firing_gas_kwh=_spec_value(payload, "firing_gas_kwh", 30.0, 0.1, 2000.0),
+        ship_kg=_spec_value(payload, "ship_kg", 5.0, 0.1, 500.0),
+        estimated=True,
     )
 
 

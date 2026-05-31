@@ -143,12 +143,17 @@ def build_recommendation(
     shock_affected: Iterable[str] = (),
     shock_label: str = "",
     base_risk_premium: float = 0.0,
+    product: Product | None = None,
 ) -> Recommendation:
     """Run the full deterministic pipeline and assemble the recommendation.
 
     ``target_month`` defaults to the nearest forecast month (the next production
     run). Everything is pure arithmetic on the committed catalog + forecast; the
     only optional, off-path I/O is a live forecast behind ``job_id`` (else mock).
+
+    ``product`` overrides the catalog lookup with a supplied :class:`Product` — used in
+    full-live mode for an LLM-estimated off-catalog product (its BOM is an input spec; the
+    decision math here stays deterministic). Default ``None`` → the committed catalog product.
 
     A chat-driven supply shock is applied via the optional ``shock_*`` params
     (default = no shock → byte-identical calm recommendation). When active, the
@@ -158,7 +163,7 @@ def build_recommendation(
     headline moves the whole ceramics decision, mirroring the gas hedge. THE RULE
     still holds: every number here is deterministic arithmetic, never an LLM output."""
     factors, source = load_ceramics_forecast(job_id)
-    product = get_product(product_id)
+    product = product if product is not None else get_product(product_id)
     months = _forecast_months(factors)
     target = target_month if target_month in months else (months[0] if months else "")
 

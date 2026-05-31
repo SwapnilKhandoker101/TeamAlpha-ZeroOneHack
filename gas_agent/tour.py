@@ -28,6 +28,7 @@ from gas_agent.geo import coords_for as _gas_coords_for
 
 # Anchor slugs — must match the invisible ``anchor_html`` markers the app places before
 # each section heading. Five gas-side, two ceramics-side.
+CHAT = "chat"  # the bottom chat — every tour starts here so you SEE the answer, then it scrolls
 GAS = "gas"
 HEDGE = "hedge"
 BACKTEST = "backtest"
@@ -38,12 +39,13 @@ CER_MAP = "cer_map"
 GLOBE_ANCHORS = frozenset({DRIVERS_GLOBE, CER_MAP})
 
 # Which sections a kind of answer walks through, in order. Sentences are zipped onto these
-# (the last anchor repeats if there are more sentences than anchors).
+# (the last anchor repeats if there are more sentences than anchors). Every walk is
+# prefixed with CHAT in build_beats, so the tour first shows the answer, then scrolls.
 ANCHOR_TEMPLATES: dict[str, list[str]] = {
     "shock": [WHY, HEDGE, BACKTEST, DRIVERS_GLOBE],
     "why": [WHY, HEDGE, DRIVERS_GLOBE],
-    "country": [DRIVERS_GLOBE],  # "which supplier/country" — walk the globe per named region
-    "ceramics": [CERAMICS, CER_MAP],
+    "country": [DRIVERS_GLOBE],  # "which gas driver / country / region" — walk the gas globe
+    "ceramics": [CERAMICS, CER_MAP],  # supplier / channel / lock / margin — the ceramics section
     "about": [GAS, CERAMICS],
 }
 _DEFAULT_TEMPLATE = ANCHOR_TEMPLATES["why"]
@@ -121,14 +123,16 @@ def build_beats(route_kind: str, answer_text: str, *, regions: list[str] | None 
     sentences = _sentences(answer_text)
     if not sentences:
         return []
-    template = ANCHOR_TEMPLATES.get(route_kind, _DEFAULT_TEMPLATE)
+    # Start at the chat (the answer is shown there) so the user SEES the agent understood,
+    # THEN the tour scrolls to the relevant sections.
+    walk = [CHAT, *ANCHOR_TEMPLATES.get(route_kind, _DEFAULT_TEMPLATE)]
     candidates = list(regions or [])
     answer_regions = _regions_in(answer_text, candidates)
     cursor = 0  # walks answer_regions so successive globe beats visit different countries
 
     beats: list[Beat] = []
     for index, sentence in enumerate(sentences):
-        anchor = template[min(index, len(template) - 1)]
+        anchor = walk[min(index, len(walk) - 1)]
         pose = None
         if anchor in GLOBE_ANCHORS and candidates:
             here = _regions_in(sentence, candidates)
@@ -165,8 +169,12 @@ def route_kind_for(prompt: str, *, is_shock: bool, is_about: bool) -> str:
     if is_about:
         return "about"
     low = (prompt or "").lower()
-    if any(w in low for w in ("ceramic", "supplier", "channel", "lock", "margin")):
-        return "ceramics" if "ceramic" in low else "country"
-    if any(w in low for w in ("which", "country", "where", "driver", "region")):
+    # Ceramics-decision concepts → the CERAMICS section (supplier / channel / lock / margin /
+    # sell / buy / negotiate are all part of the second decision, NOT the gas drivers).
+    if any(w in low for w in ("ceramic", "supplier", "channel", "lock", "margin",
+                              "sell", "buy", "negotiat", "product")):
+        return "ceramics"
+    # Gas-driver / geography questions → the gas drivers globe.
+    if any(w in low for w in ("driver", "country", "region", "which", "where")):
         return "country"
     return "why"

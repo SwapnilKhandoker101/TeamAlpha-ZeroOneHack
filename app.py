@@ -651,6 +651,23 @@ def _resolve_ceramics_job() -> str | None:
     return st.session_state.get("scenario_cer_ref")  # None → load_ceramics_forecast uses the mock
 
 
+@st.cache_data(show_spinner="🧪 Recognising your product…")
+def _cached_estimate_product(description: str):
+    """LLM product recognition for an off-catalog item (cached by description, so it runs
+    once per business). Returns a catalog Product when it matches, else an estimated one."""
+    return intake.estimate_product(description)
+
+
+def _resolve_custom_product(profile: intake.CompanyProfile):
+    """In FULL-LIVE mode only, recognise an off-catalog product (e.g. 'sinks') via the LLM
+    and return its estimated :class:`Product`; ``None`` when it matches the catalog or when
+    live mode is off (the offline/cached demo always uses the committed 3-product catalog)."""
+    if not st.session_state.get("live_mode_on"):
+        return None
+    product = _cached_estimate_product(profile.description)
+    return product if getattr(product, "estimated", False) else None
+
+
 def _resolve_scenario(profile: intake.CompanyProfile) -> None:
     """Match the profile to the nearest committed library scenario (W17) and stash the
     job refs both sections resolve through. A forecast depends only on (product,
@@ -791,6 +808,7 @@ def render_chat_panel() -> None:
     months, spot, curation = resolved
 
     st.divider()
+    _anchor("chat")  # tours start here so you see the answer before they scroll (W16)
     st.subheader("💬 Talk to the agent — push a shock, or ask why")
     st.caption("Type (or speak) a supply-shock headline and **both** decisions re-run on the "
                "spot — the LLM only reads the severity, the deterministic policies move the "
@@ -1208,10 +1226,13 @@ def _render_intake_settings() -> None:
     have_key = config.have_sybilion_key()
     with st.expander("⚙️ Advanced — live forecast & chat behaviour (optional)"):
         st.toggle(
-            "Live Sybilion forecast on submit", key="live_mode_on", disabled=not have_key,
-            help="OFF (default): instant — served from the committed scenario library / cache. "
-                 "ON: also fetch a FRESH live forecast on submit (~11 min; polls in the background, "
-                 "and falls back to the matched scenario if anything is unreachable).")
+            "Live Sybilion forecast — fetch everything for THIS business & wait", key="live_mode_on",
+            disabled=not have_key,
+            help="OFF (default): instant — the nearest pre-fetched scenario from the committed "
+                 "library / cache. ON: on submit, fetch a FRESH live forecast tailored to your exact "
+                 "description (the gas band + all four cost factors, in parallel) and wait for every "
+                 "response (~11 min, up to 30; polls in the background, falls back to the matched "
+                 "scenario if anything is unreachable). The matched scenario shows instantly meanwhile.")
         if not have_key:
             st.caption("🔒 Add `SYBILION_API_KEY` to enable live forecasting.")
         st.toggle(
@@ -1430,7 +1451,7 @@ def _render_profile_summary(profile: intake.CompanyProfile) -> None:
 # fallback keeps the cached/library demo whenever a job fails or times out.
 # --------------------------------------------------------------------------- #
 LIVE_TICK_SECONDS = 4.0
-LIVE_MAX_TICKS = 230  # ~15 minutes at 4s/tick — generous headroom over the ~11 min jobs
+LIVE_MAX_TICKS = 450  # ~30 minutes at 4s/tick — waits out even a slow full live run
 
 
 def _gas_live_payload(persona: str) -> dict:
@@ -1498,8 +1519,9 @@ def _render_live_progress(run: dict) -> None:
         return {"completed": "✓", "failed": "✗"}.get(status, "…")
 
     factors = " · ".join(f"{f} {mark(j)}" for f, j in run.get("factor_jobs", {}).items()) or "queuing…"
-    st.info(f"⏳ Forecasting live against today's market — a real Sybilion job can take ~11 min "
-            f"(polling every {int(LIVE_TICK_SECONDS)}s, runs in the background). "
+    st.info(f"⏳ Fetching EVERYTHING live for your business and waiting for every response — the "
+            f"gas band + all four cost factors, in parallel (a real Sybilion job can take ~11 min; "
+            f"waits up to 30, polling every {int(LIVE_TICK_SECONDS)}s in the background). "
             f"gas {mark(run.get('gas_job'))} · {factors}")
     if st.button("Cancel", key="live_cancel"):
         st.session_state.pop("live_run", None)
@@ -1636,7 +1658,8 @@ def main() -> None:
     if focus in ("Both", "Ceramics only"):
         from ceramics_agent.dashboard import render_ceramics_tab
 
-        render_ceramics_tab(render_voiceover, profile=profile, job_id=_resolve_ceramics_job())
+        render_ceramics_tab(render_voiceover, profile=profile, job_id=_resolve_ceramics_job(),
+                            custom_product=_resolve_custom_product(profile))
 
     # One shared chat for both decisions, full-width at the page bottom.
     render_chat_panel()

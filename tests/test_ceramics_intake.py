@@ -14,6 +14,7 @@ from ceramics_agent.cost_policy import default_weights
 from ceramics_agent.intake import (
     CompanyProfile,
     apply_answer,
+    estimate_product,
     follow_up_questions,
     parse_description,
     weights_for_gas_exposure,
@@ -184,3 +185,46 @@ def test_persona_includes_structured_facts():
     assert "Bavarian tile maker" in persona
     assert "Handmade Bowl" in persona  # the resolved product name
     assert "5,000" in persona
+
+
+# --------------------------------------------------------------------------- #
+# estimate_product — off-catalog recognition (full-live mode); LLM-estimated INPUT spec
+# --------------------------------------------------------------------------- #
+def test_estimate_product_falls_back_to_catalog_offline(monkeypatch):
+    # No LLM → a committed catalog product, never an estimated spec (offline floor).
+    monkeypatch.setattr(llm, "featherless_available", lambda: False)
+    product = estimate_product("We make 8000 floor tiles.")
+    assert product.id == "tile" and product.estimated is False
+
+
+def test_estimate_product_returns_catalog_when_llm_recognises_one(monkeypatch):
+    monkeypatch.setattr(llm, "featherless_available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: {"catalog_id": "dinnerware"})
+    product = estimate_product("We make dinner sets.")
+    assert product.id == "dinnerware" and product.estimated is False
+
+
+def test_estimate_product_builds_an_estimated_custom_spec(monkeypatch):
+    monkeypatch.setattr(llm, "featherless_available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: {
+        "catalog_id": None, "name": "Ceramic Sink",
+        "clay_kg": 9.0, "glaze_kg": 0.8, "kiln_kwh": 14.0, "firing_gas_kwh": 55.0, "ship_kg": 12.0,
+    })
+    product = estimate_product("We make 10000 ceramic sinks.")
+    assert product.id == "custom" and product.estimated is True
+    assert product.name == "Ceramic Sink"
+    assert product.firing_gas_kwh == 55.0 and product.clay_kg == 9.0
+
+
+def test_estimate_product_clamps_absurd_values(monkeypatch):
+    monkeypatch.setattr(llm, "featherless_available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: {
+        "catalog_id": None, "name": "Giant thing",
+        "clay_kg": 999999, "glaze_kg": -5, "kiln_kwh": 0, "firing_gas_kwh": "bad", "ship_kg": 9e9,
+    })
+    product = estimate_product("absurd")
+    assert 0.1 <= product.clay_kg <= 300.0          # clamped to the sane ceiling
+    assert product.glaze_kg == 0.0                  # negative → floor 0
+    assert product.kiln_kwh == 0.1                  # 0 → floor 0.1 (must be positive)
+    assert product.firing_gas_kwh == 30.0           # non-numeric → the documented default
+    assert product.ship_kg == 500.0                 # huge → ceiling

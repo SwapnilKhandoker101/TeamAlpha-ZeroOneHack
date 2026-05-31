@@ -159,7 +159,7 @@ hackathon/
 │   ├── backtest.py              # replay: agent vs random / cheap / always-top-ranked (W12)
 │   ├── recommend.py             # orchestrates forecast→lock→curation→negotiation→backtest (pure)
 │   ├── explanation.py           # LLM narrates the decided recommendation (explain-only; template fallback)
-│   ├── intake.py                # W1: company-description → CompanyProfile (LLM extracts, never invents)
+│   ├── intake.py                # W1: description → CompanyProfile; estimate_product() recognises an off-catalog product (full-live, LLM-estimated editable BOM)
 │   ├── pipeline.py              # W2: staged pipeline-animation stage list + LLM blurbs (template fallback)
 │   ├── impact.py                # W4: cross-decision "what moves what" driver-impact rows (pure)
 │   ├── scenario.py              # W6: one shock re-decides ceramics too (factor-routed, deterministic)
@@ -180,7 +180,7 @@ hackathon/
 ├── REPORT.md                    # submission write-up (TL;DR, approach, real numbers, credits)
 ├── README.md                    # clean-checkout setup/run + no-keys demo + what's live vs mocked
 ├── requirements.txt             # exported from uv.lock so `pip install -r` works on a clean checkout
-├── tests/                       # 299 tests, all green (offline, deterministic)
+├── tests/                       # 311 tests, all green (offline, deterministic)
 └── docs/
     ├── APP_GUIDE.md             # user guide (how it works, how we know it's good)
     ├── ARCHITECTURE.md          # build & design-rationale (why each choice)
@@ -195,7 +195,7 @@ hackathon/
 uv sync                              # install deps
 cp .env.example .env                 # optional: add real keys (demo runs without them)
 uv run streamlit run app.py          # the dashboard — one page, both decisions, runs keyless
-uv run pytest -q                     # 299 tests, all pass (offline, deterministic)
+uv run pytest -q                     # 311 tests, all pass (offline, deterministic)
 uv run python -m gas_agent.decision_backtest   # gas backtest verdict (+ extended baselines + shocked)
 uv run python -m ceramics_agent.backtest       # ceramics backtest verdict (+ top-ranked + 24-month)
 uv run python scripts/build_voiceover.py       # regenerate narration into cache/audio/
@@ -213,7 +213,7 @@ uv run python scripts/build_scenarios.py          # build the full live scenario
 ## 5. Current state (as of 2026-05-31)
 
 **Everything is built and verified — the unified-app wave (W1–W12) AND the "narrated
-demo" wave (W13–W18).** All three judging axes are covered. **299 tests pass** (offline,
+demo" wave (W13–W18).** All three judging axes are covered. **311 tests pass** (offline,
 deterministic). The **gas decision math is byte-identical** (calm quarter ratio 30.5%,
 standing premium +6.9%, curation 25 kept / 6 rejected, backtest verdict unchanged).
 
@@ -254,6 +254,22 @@ additive & behaviour-preserving (the new `tour.py` / `scenarios.py` are new file
 `sybilion_client` split + raised timeout + cache→scenarios resolver are additive). New W12
 live numbers are in the sub-tables below. `docs/` (APP_GUIDE / ARCHITECTURE) still describe
 the pre-unification tabbed layout and are the next doc to refresh if time allows.
+
+Post-wave fixes (also built & verified, **311 tests**):
+- **Voice input fixed.** The retired `api-inference.huggingface.co` host is auto-rewritten to
+  the `router.huggingface.co/hf-inference` endpoint, and `transcribe.py` now **surfaces the
+  real error** instead of silently returning None. Added a **local Whisper** rung
+  (`faster-whisper`, optional `--extra localasr`) so the ASR ladder is NVIDIA → HF → **local
+  (offline, no key)**; `ASR_PROVIDER=local` forces fully offline. Voice mic added at intake (W14).
+- **Tour fixes.** Ceramics-decision questions (supplier/lock/margin) now route to the **ceramics
+  section** (was a bug → gas globe), and every tour **starts at the chat** (shows the answer)
+  before scrolling (a new `chat` anchor).
+- **General custom-product live mode.** In full-live mode, an **off-catalog product** (e.g.
+  "sinks") is recognised by the LLM, which **estimates an editable per-unit BOM** —
+  `intake.estimate_product()` → `build_recommendation(..., product=…)` → the dashboard's editable
+  spec panel. THE RULE holds: the BOM is a labeled, editable *input* (offline always uses the
+  committed 3-product catalog); the lock/supplier/margin stay deterministic. The non-blocking
+  live deadline was raised to ~30 min ("fetch everything & wait").
 
 A second wave (the `edges.md` follow-up) is also built and verified:
 1. **Future-proof whitelist keywords** — `driver_curation` now recognises Brent,

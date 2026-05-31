@@ -92,7 +92,7 @@ it names — all from the deterministic numbers (the LLM only narrates).
 ## Other commands
 
 ```bash
-uv run pytest -q                              # 299 offline tests, all green
+uv run pytest -q                              # 311 offline tests, all green
 uv run python -m gas_agent.decision_backtest  # gas backtest verdict (policy vs 0/50/100% + random + shocked)
 uv run python -m ceramics_agent.backtest      # ceramics backtest verdict (agent vs random/cheap/top-ranked + 24-mo)
 uv run python scripts/build_scenarios.py --seed   # seed the scenario library offline (no key)

@@ -53,6 +53,7 @@ class Product:
     kiln_kwh: float  # grid electricity per unit -> the "power" factor
     firing_gas_kwh: float  # kiln gas burned per unit -> the "gas" factor (the dominant cost)
     ship_kg: float  # shipped weight per unit -> the "shipping" factor
+    estimated: bool = False  # True for an LLM-estimated off-catalog product (an editable input spec)
 
 
 PRODUCTS: dict[str, Product] = {

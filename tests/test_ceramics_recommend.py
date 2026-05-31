@@ -39,6 +39,25 @@ def test_build_recommendation_produces_a_complete_decision():
     assert neg.total_margin == neg.unit_margin * rec.quantity
 
 
+def test_custom_product_override_runs_the_deterministic_pipeline():
+    # An off-catalog (LLM-estimated) product flows through the unchanged decision engine.
+    from ceramics_agent.catalog import Product
+
+    sink = Product(id="custom", name="Ceramic Sink", clay_kg=9.0, glaze_kg=0.8,
+                   kiln_kwh=14.0, firing_gas_kwh=55.0, ship_kg=12.0, estimated=True)
+    rec = build_recommendation("custom", 10000, 28, default_weights(), "high", product=sink)
+    assert rec.product.name == "Ceramic Sink" and rec.product.estimated is True
+    # The decision is complete + deterministic on the supplied spec.
+    assert 0.10 <= rec.lock_ratio <= 0.90 and rec.unit_cost > 0
+    assert rec.chosen_supplier is not None and rec.backtest.n_months == 12
+    # A heavier, more gas-intensive product costs more per unit than a Handmade Bowl.
+    bowl = build_recommendation("bowl", 10000, 28, default_weights(), "high")
+    assert rec.unit_cost > bowl.unit_cost
+    # Reproducible: identical inputs → identical core numbers.
+    assert _core(rec) == _core(
+        build_recommendation("custom", 10000, 28, default_weights(), "high", product=sink))
+
+
 def test_target_month_defaults_to_the_nearest_forecast_month():
     months = available_months()
     rec = build_recommendation("tile", 5000, 14, default_weights(), "medium")

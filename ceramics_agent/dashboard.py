@@ -53,12 +53,14 @@ def _cached_recommendation(
     shock_magnitude: float = 0.0,
     shock_affected: tuple[str, ...] = (),
     shock_label: str = "",
+    product=None,  # an LLM-estimated off-catalog Product (full-live mode); frozen → hashable cache key
 ) -> Recommendation:
     weights = CostWeights(*weights_tuple)
     return build_recommendation(
         product_id, quantity, timeline_days, weights, competition,
         target_month=target_month, job_id=job_id,
         shock_magnitude=shock_magnitude, shock_affected=shock_affected, shock_label=shock_label,
+        product=product,
     )
 
 
@@ -356,7 +358,7 @@ def _export_frame(rec: Recommendation) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # The ceramics section (rendered below the gas section on the single page)
 # --------------------------------------------------------------------------- #
-def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
+def render_ceramics_tab(render_voiceover, profile=None, job_id=None, custom_product=None) -> None:
     """Render the ceramics optimizer section.
 
     ``render_voiceover`` is the app's narration helper, passed in so voice is reused.
@@ -364,7 +366,10 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
     page's one company description — when present it seeds the inputs (product /
     quantity / timeline / competition / cost weights), so the same description drives
     both decisions. ``job_id`` is the resolved forecast job (a live ceramics job when
-    the unified Live toggle is on, else ``None`` → the committed mock)."""
+    the unified Live toggle is on, else ``None`` → the committed mock).
+    ``custom_product`` is an LLM-ESTIMATED off-catalog :class:`Product` (full-live mode):
+    when present, the 3-product selectbox is replaced by its name + an editable per-unit
+    material spec, and the decision runs deterministically on that (THE RULE holds)."""
     st.markdown(tour.anchor_html("ceramics"), unsafe_allow_html=True)
     st.header("② How should we run the ceramics line?")
     st.caption(
@@ -402,13 +407,20 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
         d_w = (0.40, 0.35, 0.15, 0.10)
     version = st.session_state.get("profile_version", 0)
     levels = ["low", "medium", "high"]
+    effective_product = None  # set to the (edited) custom Product when off-catalog
 
     with st.container(border=True):
         row1 = st.columns([2, 1, 1, 1])
-        product_id = row1[0].selectbox(
-            "Product", options=product_ids, index=product_ids.index(d_product),
-            format_func=lambda pid: name_by_id[pid], key=f"cer_product_{version}",
-        )
+        if custom_product is not None:
+            # Off-catalog product recognised live — show its name (not the 3-product picker).
+            row1[0].text_input("Product (recognised live 🧪)", value=custom_product.name,
+                               disabled=True, key=f"cer_custom_name_{version}")
+            product_id = "custom"
+        else:
+            product_id = row1[0].selectbox(
+                "Product", options=product_ids, index=product_ids.index(d_product),
+                format_func=lambda pid: name_by_id[pid], key=f"cer_product_{version}",
+            )
         quantity = row1[1].number_input(
             "Quantity (units)", min_value=100, max_value=50000, value=d_qty, step=100,
             key=f"cer_qty_{version}",
@@ -431,6 +443,25 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
             format_func=lambda m: m[:7],
         ) if months else default_target
 
+        if custom_product is not None:
+            # The LLM-estimated bill of materials — an editable INPUT (not a decision).
+            with st.expander("🧪 Estimated materials per unit (LLM input — edit if you know better)",
+                             expanded=False):
+                bom = st.columns(5)
+                clay_kg = bom[0].number_input("clay kg", 0.0, 300.0, float(custom_product.clay_kg),
+                                              0.1, key=f"cer_bom_clay_{version}")
+                glaze_kg = bom[1].number_input("glaze kg", 0.0, 50.0, float(custom_product.glaze_kg),
+                                               0.05, key=f"cer_bom_glaze_{version}")
+                power_kwh = bom[2].number_input("power kWh", 0.0, 500.0, float(custom_product.kiln_kwh),
+                                                0.5, key=f"cer_bom_power_{version}")
+                gas_kwh = bom[3].number_input("gas kWh", 0.0, 2000.0, float(custom_product.firing_gas_kwh),
+                                              1.0, key=f"cer_bom_gas_{version}")
+                ship_kg = bom[4].number_input("ship kg", 0.0, 500.0, float(custom_product.ship_kg),
+                                              0.5, key=f"cer_bom_ship_{version}")
+            from dataclasses import replace as _replace
+            effective_product = _replace(custom_product, clay_kg=clay_kg, glaze_kg=glaze_kg,
+                                         kiln_kwh=power_kwh, firing_gas_kwh=gas_kwh, ship_kg=ship_kg)
+
     weights = CostWeights(gas_w, clay_w, energy_w, transport_w)
     norm = weights.normalized()
     st.caption(
@@ -452,6 +483,7 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
         product_id, int(quantity), int(timeline_days), weights_tuple,
         competition, target_month, job_id,
         shock_magnitude, shock_affected, shock_label,
+        product=effective_product,
     )
 
     # Stash the (calm) ceramics decision so the shared bottom chat can ground a spoken
@@ -467,6 +499,15 @@ def render_ceramics_tab(render_voiceover, profile=None, job_id=None) -> None:
         "weights_tuple": weights_tuple,
         "job_id": job_id,
     }
+
+    if custom_product is not None:
+        st.warning(
+            f"🧪 **{custom_product.name}** isn't in the catalog — the agent **recognised it from your "
+            "description and estimated its per-unit materials** (the editable spec above). Everything "
+            "below — the lock %, supplier, channel, negotiated margin, backtest — is still computed "
+            "**deterministically** from that spec; only the material estimate is the LLM's, and you can "
+            "correct it."
+        )
 
     if rec.source == "mock":
         st.info(
